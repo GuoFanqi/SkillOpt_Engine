@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Godfrey's SkillOpt Engine</title>
+    <style>
+      /* ── Pre-React loading skeleton ── */
+      #preloader {
+        position: fixed; inset: 0;
+        background: #f8fafc;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        z-index: 9999;
+        transition: opacity 0.3s ease;
+      }
+      #preloader .logo {
+        width: 48px; height: 48px;
+        background: linear-gradient(135deg, #1e293b, #334155);
+        border-radius: 16px;
+        display: flex; align-items: center; justify-content: center;
+        margin-bottom: 16px;
+      }
+      #preloader .logo span {
+        color: #fff; font-weight: 600; font-size: 18px;
+        font-family: system-ui, sans-serif;
+      }
+      #preloader .spinner {
+        width: 28px; height: 28px;
+        border: 3px solid #e2e8f0;
+        border-top-color: #6366f1;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      #preloader .text {
+        margin-top: 12px;
+        font-size: 13px; color: #94a3b8;
+        font-family: system-ui, sans-serif;
+      }
+      /* ── Skeleton pulse for page cards ── */
+      .skeleton-pulse {
+        animation: skeleton-pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      @keyframes skeleton-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.4; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- React 挂载前显示，挂载后自动被替换 -->
+    <div id="preloader">
+      <div class="logo"><span>LSE</span></div>
+      <div class="spinner"></div>
+      <div class="text">加载中......</div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

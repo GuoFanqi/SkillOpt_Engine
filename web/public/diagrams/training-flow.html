@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>SKILLOPT 训练流程 — 训练任务_20260531_100904</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8fafc; padding: 24px; }
+  h1 { font-size: 22px; color: #1e293b; margin-bottom: 4px; }
+  .subtitle { font-size: 13px; color: #64748b; margin-bottom: 20px; }
+  .mermaid { background: white; border-radius: 16px; padding: 32px 16px; box-shadow: 0 1px 3px rgba(0,0,0,.06); overflow-x: auto; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 12px; margin-bottom: 20px; }
+  .metric { background: white; border-radius: 12px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.05); text-align: center; }
+  .metric .value { font-size: 24px; font-weight: 700; color: #1e293b; }
+  .metric .label { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+  .red .value { color: #dc2626; }
+  .amber .value { color: #d97706; }
+  .green .value { color: #16a34a; }
+</style>
+</head>
+<body>
+<h1>SKILLOPT 训练任务执行流程</h1>
+<p class="subtitle">任务名：skillopt_searchqa_训练任务_20260531_100904 · 模型：deepseek-chat · 框架：searchqa · 6训练 / 2验证 / 2测试 · 总耗时 333.5s</p>
+
+<div class="metrics">
+  <div class="metric red"><div class="value">0/4</div><div class="label">接受 / 总步数</div></div>
+  <div class="metric amber"><div class="value">50%→50%</div><div class="label">Baseline → Best 分数</div></div>
+  <div class="metric"><div class="value">68.9k</div><div class="label">总 Token 消耗</div></div>
+  <div class="metric"><div class="value">54</div><div class="label">总 API 调用次数</div></div>
+  <div class="metric"><div class="value">333.5s</div><div class="label">总墙钟时间</div></div>
+  <div class="metric red"><div class="value">Δ=0</div><div class="label">Test 差值</div></div>
+</div>
+
+<div class="mermaid">
+flowchart TB
+    subgraph INIT["🟦 初始化"]
+        direction LR
+        I1["初始 Skill<br/>40 字符 / 3 规则<br/>「读上下文 → 提取 → 简洁」"] --> I2["分割数据<br/>train=6 / val=2 / test=2"]
+        I2 --> I3["Baseline 评测<br/>selection=50% / test=50%"]
+    end
+
+    INIT --> E1
+
+    subgraph E1["🟨 EPOCH 1 — 2 steps"]
+        direction TB
+        subgraph S1["STEP 1 ⏱48.5s · batch=4 题"]
+            direction LR
+            S1a["① ROLLOUT<br/>enc=4 · hard=25%<br/>答对 1/4"]
+            S1b["② REFLECT<br/>2 patches<br/>analyst×2 ⏱22s"]
+            S1c["③ AGGREGATE<br/>去重合并 ⏱13s"]
+            S1d["④ SELECT<br/>5→top3 ⏱7s"]
+            S1e["⑤ UPDATE<br/>3 编辑应用<br/>skill=190 字符"]
+            S1f["⑥ EVALUATE<br/>val 上跑 → 50%"]
+            S1g(("❌ REJECT<br/>没超过 50%"))
+            S1a-->S1b-->S1c-->S1d-->S1e-->S1f-->S1g
+        end
+        subgraph S2["STEP 2 ⏱82.6s · batch=剩余题"]
+            direction LR
+            S2a["① ROLLOUT<br/>累计 38 rollout calls"]
+            S2b["②→⑤ REFLECT·AGGREGATE·SELECT·UPDATE"]
+            S2c["⑥ EVALUATE → 50%"]
+            S2d(("❌ REJECT"))
+            S2a-->S2b-->S2c-->S2d
+        end
+        S1 --> S2
+    end
+
+    E1 --> SU1
+
+    subgraph SU1["🟩 SLOW UPDATE — Epoch 1 结束"]
+        direction LR
+        L1a["纵向对比<br/>epoch0 初始 vs epoch1 当前"]
+        L1b["Optimizer 分析<br/>写经验指导"]
+        L1c["注入 &lt;!--SLOW_UPDATE--&gt;<br/>skill 当前 = 94 字符"]
+        L1a-->L1b-->L1c
+    end
+
+    SU1 --> E2
+
+    subgraph E2["🟨 EPOCH 2 — 2 steps（从 slow_update 出发）"]
+        direction TB
+        subgraph S3["STEP 3 ⏱82s · batch=4 题"]
+            direction LR
+            S3a["① ROLLOUT<br/>基于 meta_skill 作答"]
+            S3b["②→⑤ REFLECT·AGGREGATE·SELECT·UPDATE<br/>多轮分析"]
+            S3c["⑥ EVALUATE → 50%"]
+            S3d(("❌ REJECT"))
+            S3a-->S3b-->S3c-->S3d
+        end
+        subgraph S4["STEP 4 ⏱48.5s · batch=2 题"]
+            direction LR
+            S4a["① ROLLOUT<br/>enc=2 · hard=0%<br/>仅 1 个 failure_patch"]
+            S4b["② REFLECT<br/>analyst×1 · ⏱40s<br/>深度分析唯一错题"]
+            S4c["③ AGGREGATE<br/>❌ 0 calls — 无需 merge"]
+            S4d["④ SELECT<br/>2编辑→top1"]
+            S4e["⑤ UPDATE<br/>1 编辑 · skill=168 字符"]
+            S4f["⑥ EVALUATE → 50%"]
+            S4g(("❌ REJECT"))
+            S4a-->S4b-->S4c-->S4d-->S4e-->S4f-->S4g
+        end
+        S3 --> S4
+    end
+
+    E2 --> SU2
+
+    subgraph SU2["🟩 SLOW UPDATE — Epoch 2 结束"]
+        L2["对比 epoch1 vs epoch2<br/>origin = slow_update_epoch_02"]
+    end
+
+    SU2 --> FINAL
+
+    subgraph FINAL["🟪 训练结束"]
+        direction LR
+        F1["best_skill = initial_skill<br/>从未被超越"]
+        F2["test 最终结果<br/>baseline=50% vs best=50%"]
+        F3["Δ = 0.0<br/>0 accepts / 4 rejects"]
+        F1-->F2-->F3
+    end
+
+    style S1g fill:#fee2e2,stroke:#ef4444,stroke-width:2px,color:#991b1b
+    style S2d fill:#fee2e2,stroke:#ef4444,stroke-width:2px,color:#991b1b
+    style S3d fill:#fee2e2,stroke:#ef4444,stroke-width:2px,color:#991b1b
+    style S4g fill:#fee2e2,stroke:#ef4444,stroke-width:2px,color:#991b1b
+    style INIT fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    style FINAL fill:#f3e8ff,stroke:#9333ea,color:#4c1d95
+    style SU1 fill:#dcfce7,stroke:#22c55e,color:#166534
+    style SU2 fill:#dcfce7,stroke:#22c55e,color:#166534
+</div>
+
+<script>mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'loose' });</script>
+</body>
+</html>

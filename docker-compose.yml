@@ -1,0 +1,107 @@
+services:
+  # ─── MySQL Database ───
+  db:
+    image: mysql:8.0
+    container_name: loopskill-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-skillopt}
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --max_allowed_packet=128M
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - "3307:3306"
+    networks:
+      - loopskill
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ─── LoopSkill Engine Web App ───
+  app:
+    build: .
+    container_name: loopskill-app
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3002}:3002"
+    environment:
+      NODE_ENV: production
+      PORT: "3002"
+      # MySQL
+      MYSQL_HOST: db
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-skillopt}
+      # JWT
+      JWT_SECRET: ${JWT_SECRET}
+      TOKEN_EXPIRY: ${TOKEN_EXPIRY:-24h}
+      # CORS
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3002}
+      # Python
+      VENV_PYTHON: /app/venv/bin/python3
+      # LLM API (OpenAI-compatible)
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_AUTH_MODE: ${AZURE_OPENAI_AUTH_MODE:-openai_compatible}
+      # Claude (optional)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Qwen (optional)
+      QWEN_CHAT_BASE_URL: ${QWEN_CHAT_BASE_URL:-}
+      QWEN_CHAT_MODEL: ${QWEN_CHAT_MODEL:-}
+      # MiniMax (optional)
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_MODEL: ${MINIMAX_MODEL:-}
+      # SMS (optional)
+      SMS_SECRET_ID: ${SMS_SECRET_ID:-}
+      SMS_SECRET_KEY: ${SMS_SECRET_KEY:-}
+      SMS_SDK_APP_ID: ${SMS_SDK_APP_ID:-}
+      SMS_SIGN_NAME: ${SMS_SIGN_NAME:-}
+      SMS_TEMPLATE_ID: ${SMS_TEMPLATE_ID:-}
+      # Email (optional)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+    volumes:
+      - app_outputs:/app/web/outputs
+      - app_uploads:/app/web/uploads
+    networks:
+      - loopskill
+    depends_on:
+      db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2"
+        reservations:
+          memory: 1G
+          cpus: "1"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+networks:
+  loopskill:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  app_outputs:
+  app_uploads:
