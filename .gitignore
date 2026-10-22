@@ -85,7 +85,7 @@ tests/launch_*.py
 *.launch.log
 
 # Local env & agent config
-venv/
+venv
 
 # Local env & agent config
 .claude/

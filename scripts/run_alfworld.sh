@@ -3,8 +3,8 @@
 # SkillOpt — ALFWorld training launch script
 #
 # Prerequisites:
-#   pip install -e ".[alfworld]"
-#   pip install alfworld[full] && alfworld-download
+#   uv pip install -e ".[alfworld]"
+#   uv pip install alfworld[full] && alfworld-download
 #
 # Usage:
 #   bash scripts/run_alfworld.sh
@@ -25,7 +25,7 @@ if [ ! -d "${ALFWORLD_DATA}/json_2.1.1" ]; then
     echo "ERROR: ALFWorld data not found at ${ALFWORLD_DATA}/json_2.1.1"
     echo ""
     echo "To download ALFWorld data, run:"
-    echo "  pip install alfworld[full]"
+    echo "  uv pip install alfworld[full]"
     echo "  alfworld-download"
     echo ""
     echo "Or set ALFWORLD_DATA to the directory containing json_2.1.1/"

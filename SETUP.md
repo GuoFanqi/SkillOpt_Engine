@@ -4,7 +4,8 @@
 
 | 依赖 | 版本 | 说明 |
 |------|------|------|
-| Python | 3.10+ | 训练脚本运行 |
+| uv | 最新 | Python 环境与依赖管理 |
+| Python | 3.10+ | 由 uv 自动下载管理 |
 | Node.js | 18+ | Web 服务运行 |
 | MySQL | 8.0+ | 数据持久化 |
 
@@ -44,16 +45,28 @@ export MYSQL_DATABASE=skillopt
 
 ## 2. Python 环境
 
-### 创建虚拟环境
+本项目使用 [uv](https://docs.astral.sh/uv/) 管理 Python 环境与依赖，虚拟环境位于项目根目录 `.venv/`，依赖版本由 `uv.lock` 精确锁定。
+
+### 安装 uv（仅首次）
 ```bash
-cd skillopt-engine
-python3 -m venv venv
-source venv/bin/activate
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### 安装依赖
+### 同步环境
 ```bash
-pip install -r requirements.txt
+cd SkillOpt_proj
+uv sync
+```
+
+### 项目改名 / 拷贝到其他路径后
+`.venv` 内部记录了绝对路径，项目移动后会失效，重建即可（约半分钟，版本与原来完全一致）：
+```bash
+rm -rf .venv && uv sync
+```
+
+### 安装新的依赖包
+```bash
+uv add 包名
 ```
 
 ### 依赖清单
@@ -109,14 +122,14 @@ export OPENAI_API_KEY="sk-xxx"
 
 ### 启动后端
 ```bash
-cd skillopt-engine
+cd SkillOpt_proj
 npx tsx web/server/src/index.ts
 # 监听 http://localhost:3002
 ```
 
 ### 启动前端
 ```bash
-cd skillopt-engine/web
+cd SkillOpt_proj/web
 npx vite --port 5173
 # 监听 http://localhost:5173
 ```
@@ -150,7 +163,7 @@ http://localhost:5173
 ## 7. 项目结构
 
 ```
-skillopt-engine/
+SkillOpt_proj/
 ├── skillopt/              # ReflACT 训练框架
 │   ├── engine/trainer.py  # 主训练器
 │   ├── envs/              # 基准测试环境
@@ -163,7 +176,8 @@ skillopt-engine/
 │   └── server/src/        # 后端服务
 ├── configs/               # 训练配置 YAML
 ├── scripts/train.py       # 训练入口脚本
-├── requirements.txt       # Python 依赖
+├── uv.lock                # 依赖精确版本锁定
+├── requirements.txt       # Python 依赖（Docker 构建使用）
 └── SETUP.md               # 本文件
 ```
 

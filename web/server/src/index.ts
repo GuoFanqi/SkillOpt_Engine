@@ -1965,7 +1965,7 @@ async function handleStartTraining(
     console.warn('Pre-flight API key verification failed (network):', err.message)
   }
 
-  const venvPython = join(projectRoot, 'venv', 'bin', 'python3')
+  const venvPython = join(projectRoot, '.venv', 'bin', 'python3')
   const pythonCmd = existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3')
   const trainScript = join(projectRoot, 'scripts', 'train.py')
   const trainingProcess = spawn(pythonCmd, [
@@ -2386,7 +2386,7 @@ app.post('/api/train/:id/restart', optionalAuth, async (req: any, res) => {
 
     // 5. Re-spawn
     const projectRoot = process.cwd()
-    const venvPython = join(projectRoot, 'venv', 'bin', 'python3')
+    const venvPython = join(projectRoot, '.venv', 'bin', 'python3')
     const pythonCmd = existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3')
     const trainScript = join(projectRoot, 'scripts', 'train.py')
     if (!existsSync(trainScript)) return res.status(500).json({ error: `训练脚本不存在: ${trainScript}` })

@@ -142,8 +142,8 @@ To materialize the runnable SearchQA split used by
 `configs/searchqa/default.yaml`, install the optional dependency and run:
 
 ```bash
-python -m pip install 'skillopt[searchqa]'
-python scripts/materialize_searchqa.py
+uv pip install -e '.[searchqa]'
+uv run python scripts/materialize_searchqa.py
 ```
 
 This writes full examples to:
