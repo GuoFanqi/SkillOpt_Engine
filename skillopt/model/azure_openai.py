@@ -430,7 +430,7 @@ def _chat_impl(
 
         except Exception as e:  # noqa: BLE001
             last_err = e
-            sleep = min(2 ** attempt, 30)
+            sleep = min(2 ** attempt, 60)
             time.sleep(sleep)
 
     raise RuntimeError(f"LLM call failed after {retries} retries: {last_err}")
@@ -518,7 +518,7 @@ def _chat_messages_impl(
             return (message if return_message else text), usage_info
         except Exception as e:  # noqa: BLE001
             last_err = e
-            sleep = min(2 ** attempt, 30)
+            sleep = min(2 ** attempt, 60)
             time.sleep(sleep)
 
     raise RuntimeError(f"LLM message call failed after {retries} retries: {last_err}")

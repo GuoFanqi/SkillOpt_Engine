@@ -281,7 +281,7 @@ def process_one(
                 resp_text, _ = chat_target(
                     system=system, user=user,
                     max_completion_tokens=max_completion_tokens,
-                    retries=5, stage="rollout",
+                    retries=8, stage="rollout",
                     timeout=exec_timeout,
                 )
             else:
@@ -294,7 +294,7 @@ def process_one(
                 resp_text, _ = chat_target(
                     system=system, user=refinement,
                     max_completion_tokens=max_completion_tokens,
-                    retries=5, stage="rollout",
+                    retries=8, stage="rollout",
                     timeout=exec_timeout,
                 )
 

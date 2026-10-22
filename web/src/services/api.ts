@@ -226,7 +226,10 @@ export async function deleteTraining(runId: string): Promise<{ status: string; m
     method: 'DELETE',
     headers: getAuthHeaders(),
   })
-  if (!res.ok) throw new Error('Failed to delete training')
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || '删除失败')
+  }
   return res.json()
 }
 

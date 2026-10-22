@@ -1888,7 +1888,7 @@ async function handleStartTraining(
       use_meta_skill: useMetaSkill ?? true,
     },
     gradient: {
-      analyst_workers: analystWorkers ?? 16,
+      analyst_workers: analystWorkers ?? 1,
     },
     evaluation: {
       gate_metric: gateMetric || 'soft',
@@ -1899,7 +1899,7 @@ async function handleStartTraining(
       split_dir: splitDir,
       skill_init: join(splitDir, 'initial_skill.md'),
       split_mode: 'split_dir',
-      workers: 4,
+      workers: 1,
       training_name: trainingName,
     },
   }
@@ -2300,10 +2300,10 @@ app.post('/api/train/:id/restart', optionalAuth, async (req: any, res) => {
             min_learning_rate: Math.max(1, Math.floor((flat.editBudget || 3) / 2)),
             use_slow_update: flat.useSlowUpdate ?? true, use_meta_skill: flat.useMetaSkill ?? true,
           },
-          gradient: { analyst_workers: 16 },
+          gradient: { analyst_workers: 1 },
           evaluation: { gate_metric: flat.gateMetric || 'soft' },
           eval_test: true,
-          env: { name: flat.env || 'searchqa', split_dir: splitDir, skill_init: join(splitDir, 'initial_skill.md'), split_mode: 'split_dir', workers: 4, training_name: dbRun.name },
+          env: { name: flat.env || 'searchqa', split_dir: splitDir, skill_init: join(splitDir, 'initial_skill.md'), split_mode: 'split_dir', workers: 1, training_name: dbRun.name },
         }
       } catch {}
     }

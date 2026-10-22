@@ -55,13 +55,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### 同步环境
 ```bash
 cd SkillOpt_proj
-uv sync
+uv sync --extra searchqa   # 基础依赖 + SearchQA 环境；跑 ALFWorld 另需 --extra alfworld
 ```
 
 ### 项目改名 / 拷贝到其他路径后
 `.venv` 内部记录了绝对路径，项目移动后会失效，重建即可（约半分钟，版本与原来完全一致）：
 ```bash
-rm -rf .venv && uv sync
+rm -rf .venv && uv sync --extra searchqa
 ```
 
 ### 安装新的依赖包
