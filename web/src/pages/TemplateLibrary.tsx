@@ -15,7 +15,6 @@ function DatasetPreview({ tpl }: { tpl: SkillTemplate }) {
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null)
   // 合并训练+验证集为一个列表，用 isTrain 标记
   const allItems = useMemo(() => {
-    const ratio = tpl.splitRatio ?? 0.8
     const total = tpl.trainQa.length + tpl.valQa.length
     const splitAt = total > 0 ? tpl.trainQa.length : 0
     return [...tpl.trainQa, ...tpl.valQa].map((qa, i) => ({
@@ -93,25 +92,18 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
   const { showToast } = useToast()
   const isLoggedIn = !!user
   const [templates, setTemplates] = useState<SkillTemplate[]>(allTemplates || [])
-  const [templatesLoaded, setTemplatesLoaded] = useState(false)
-
-  // Load templates from API
   useEffect(() => {
-    if (authLoading) return // Wait until auth state is known
-    if (allTemplates) { setTemplates(allTemplates); setTemplatesLoaded(true); return }
-    fetchTemplates().then(custom => {
-      const builtInIds = new Set(TEMPLATES.map(t => t.id))
-      if (isLoggedIn) {
-        // Logged-in users: see built-in templates + own custom templates
-        const extraCustom = custom.filter(t => !builtInIds.has(t.id))
-        setTemplates([...TEMPLATES, ...extraCustom])
-      } else {
-        // Guest: show built-in TEMPLATES + custom from API (dedup)
-        const extraCustom = custom.filter(t => !builtInIds.has(t.id))
-        setTemplates([...TEMPLATES, ...extraCustom])
-      }
-    }).catch(() => {}).finally(() => setTemplatesLoaded(true))
-  }, [allTemplates, isLoggedIn, authLoading])
+    if (authLoading) return
+    if (allTemplates) { setTemplates(allTemplates); return }
+    const controller = new AbortController()
+    setTemplates(TEMPLATES)
+    fetchTemplates(controller.signal).then(custom => {
+      if (controller.signal.aborted) return
+      const builtInIds = new Set(TEMPLATES.map(template => template.id))
+      setTemplates([...TEMPLATES, ...custom.filter(template => !builtInIds.has(template.id))])
+    }).catch(() => {})
+    return () => controller.abort()
+  }, [allTemplates, user?.id, authLoading])
 
   const saveTemplates = async (newTemplates: SkillTemplate[]) => {
     setTemplates(newTemplates)
@@ -131,6 +123,9 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingTemplate, setEditingTemplate] = useState<SkillTemplate | null>(null)
+  const updateEditingTemplate = (update: (template: SkillTemplate) => SkillTemplate) => {
+    setEditingTemplate(previous => previous ? update(previous) : previous)
+  }
   const [isNewTemplate, setIsNewTemplate] = useState(false)
   const [showNewTemplateModal, setShowNewTemplateModal] = useState(false)
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null)
@@ -165,6 +160,8 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
       description: '自定义案例描述',
       icon: '📝',
       category: 'analysis',
+      categoryLabel: '分析类',
+      env: 'searchqa',
       difficulty: 'medium',
       skillContent: '# 自定义 Skill\n\n## 角色\n你是一位专家。\n\n## 任务\n描述你的任务。',
       trainQa: [{ question: '示例问题', answers: ['示例答案'] }],
@@ -241,7 +238,11 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
       gateMetric: tpl.config.gateMetric,
       analystWorkers: tpl.config.analystWorkers,
       useSlowUpdate: true,
+      slowUpdateGate: false,
       useMetaSkill: true,
+      useSkillAwareReflection: false,
+      skillAwareAppendixSource: 'both',
+      skillAwareConsolidateThreshold: 0,
       dataMode: 'upload',
       uploadedFiles: {
         train: trainFile,
@@ -612,7 +613,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                   <label className="block text-xs font-medium text-gray-700 mb-1.5">案例名称</label>
                   <input
                     value={editingTemplate.name}
-                    onChange={(e) => setEditingTemplate(prev => ({ ...prev, name: e.target.value }))}
+                    onChange={(e) => updateEditingTemplate(prev => ({ ...prev, name: e.target.value }))}
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200"
                   />
                 </div>
@@ -620,7 +621,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                   <label className="block text-xs font-medium text-gray-700 mb-1.5">图标</label>
                   <input
                     value={editingTemplate.icon}
-                    onChange={(e) => setEditingTemplate(prev => ({ ...prev, icon: e.target.value }))}
+                    onChange={(e) => updateEditingTemplate(prev => ({ ...prev, icon: e.target.value }))}
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200"
                   />
                 </div>
@@ -628,7 +629,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                   <label className="block text-xs font-medium text-gray-700 mb-1.5">分类</label>
                   <select
                     value={editingTemplate.category}
-                    onChange={(e) => setEditingTemplate(prev => ({ ...prev, category: e.target.value as SkillTemplate['category'] }))}
+                    onChange={(e) => updateEditingTemplate(prev => ({ ...prev, category: e.target.value as SkillTemplate['category'] }))}
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200"
                   >
                     <option value="analysis">分析类</option>
@@ -641,7 +642,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                   <label className="block text-xs font-medium text-gray-700 mb-1.5">难度</label>
                   <select
                     value={editingTemplate.difficulty}
-                    onChange={(e) => setEditingTemplate(prev => ({ ...prev, difficulty: e.target.value as SkillTemplate['difficulty'] }))}
+                    onChange={(e) => updateEditingTemplate(prev => ({ ...prev, difficulty: e.target.value as SkillTemplate['difficulty'] }))}
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200"
                   >
                     <option value="medium">中等</option>
@@ -652,7 +653,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                   <label className="block text-xs font-medium text-gray-700 mb-1.5">描述</label>
                   <textarea
                     value={editingTemplate.description}
-                    onChange={(e) => setEditingTemplate(prev => ({ ...prev, description: e.target.value }))}
+                    onChange={(e) => updateEditingTemplate(prev => ({ ...prev, description: e.target.value }))}
                     rows={2}
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200 resize-none"
                   />
@@ -661,7 +662,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                   <label className="block text-xs font-medium text-gray-700 mb-1.5">Skill 内容</label>
                   <textarea
                     value={editingTemplate.skillContent}
-                    onChange={(e) => setEditingTemplate(prev => ({ ...prev, skillContent: e.target.value }))}
+                    onChange={(e) => updateEditingTemplate(prev => ({ ...prev, skillContent: e.target.value }))}
                     rows={8}
                     className="w-full px-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200 font-mono resize-none"
                   />
@@ -676,25 +677,25 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                   <div>
                     <label className="block text-[10px] text-gray-500 mb-1">Epochs</label>
                     <input type="number" value={editingTemplate.config.epochs} min={1} max={20}
-                      onChange={(e) => setEditingTemplate(prev => ({ ...prev, config: { ...prev.config, epochs: parseInt(e.target.value) || 1 } }))}
+                      onChange={(e) => updateEditingTemplate(prev => ({ ...prev, config: { ...prev.config, epochs: parseInt(e.target.value) || 1 } }))}
                       className="w-full px-3 py-2 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" />
                   </div>
                   <div>
                     <label className="block text-[10px] text-gray-500 mb-1">Batch Size</label>
                     <input type="number" value={editingTemplate.config.batchSize} min={1} max={100}
-                      onChange={(e) => setEditingTemplate(prev => ({ ...prev, config: { ...prev.config, batchSize: parseInt(e.target.value) || 1 } }))}
+                      onChange={(e) => updateEditingTemplate(prev => ({ ...prev, config: { ...prev.config, batchSize: parseInt(e.target.value) || 1 } }))}
                       className="w-full px-3 py-2 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" />
                   </div>
                   <div>
                     <label className="block text-[10px] text-gray-500 mb-1">Edit Budget</label>
                     <input type="number" value={editingTemplate.config.editBudget} min={1} max={20}
-                      onChange={(e) => setEditingTemplate(prev => ({ ...prev, config: { ...prev.config, editBudget: parseInt(e.target.value) || 1 } }))}
+                      onChange={(e) => updateEditingTemplate(prev => ({ ...prev, config: { ...prev.config, editBudget: parseInt(e.target.value) || 1 } }))}
                       className="w-full px-3 py-2 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" />
                   </div>
                   <div>
                     <label className="block text-[10px] text-gray-500 mb-1">调度器</label>
                     <select value={editingTemplate.config.lrScheduler}
-                      onChange={(e) => setEditingTemplate(prev => ({ ...prev, config: { ...prev.config, lrScheduler: e.target.value } }))}
+                      onChange={(e) => updateEditingTemplate(prev => ({ ...prev, config: { ...prev.config, lrScheduler: e.target.value } }))}
                       className="w-full px-3 py-2 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200">
                       <option value="cosine">Cosine</option>
                       <option value="constant">Constant</option>
@@ -703,7 +704,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                   <div>
                     <label className="block text-[10px] text-gray-500 mb-1">Gate 评分</label>
                     <select value={editingTemplate.config.gateMetric}
-                      onChange={(e) => setEditingTemplate(prev => ({ ...prev, config: { ...prev.config, gateMetric: e.target.value } }))}
+                      onChange={(e) => updateEditingTemplate(prev => ({ ...prev, config: { ...prev.config, gateMetric: e.target.value } }))}
                       className="w-full px-3 py-2 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200">
                       <option value="soft">Soft (F1)</option>
                       <option value="hard">Hard (精确)</option>
@@ -713,13 +714,13 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                 <div>
                   <label className="block text-[10px] text-gray-500 mb-1">分析线程</label>
                   <input type="number" value={editingTemplate.config.analystWorkers} min={1} max={32}
-                    onChange={(e) => setEditingTemplate(prev => ({ ...prev, config: { ...prev.config, analystWorkers: parseInt(e.target.value) || 1 } }))}
+                    onChange={(e) => updateEditingTemplate(prev => ({ ...prev, config: { ...prev.config, analystWorkers: parseInt(e.target.value) || 1 } }))}
                     className="w-full px-3 py-2 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200" />
                 </div>
                 <div>
                   <label className="block text-[10px] text-gray-500 mb-1">环境</label>
                   <select value={editingTemplate.env}
-                    onChange={(e) => setEditingTemplate(prev => ({ ...prev, env: e.target.value }))}
+                    onChange={(e) => updateEditingTemplate(prev => ({ ...prev, env: e.target.value }))}
                     className="w-full px-3 py-2 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200">
                     <option value="searchqa">SearchQA</option>
                   </select>
@@ -739,7 +740,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                       {[60, 70, 80, 90].map(pct => (
                         <button
                           key={pct}
-                          onClick={() => setEditingTemplate(prev => ({ ...prev, splitRatio: pct / 100 }))}
+                          onClick={() => updateEditingTemplate(prev => ({ ...prev, splitRatio: pct / 100 }))}
                           className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors ${
                             Math.round((editingTemplate.splitRatio ?? 0.8) * 100) === pct
                               ? 'bg-white text-indigo-600 shadow-sm'
@@ -782,7 +783,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                             onChange={(e) => {
                               const newAll = allQa.map((q, i) => i === idx ? { ...q, question: e.target.value } : q)
                               const sp = splitAt
-                              setEditingTemplate(prev => ({
+                              updateEditingTemplate(prev => ({
                                 ...prev,
                                 trainQa: newAll.slice(0, sp),
                                 valQa: newAll.slice(sp),
@@ -797,7 +798,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                             onChange={(e) => {
                               const newAll = allQa.map((q, i) => i === idx ? { ...q, answers: e.target.value.split(',').map(s => s.trim()).filter(Boolean) } : q)
                               const sp = splitAt
-                              setEditingTemplate(prev => ({
+                              updateEditingTemplate(prev => ({
                                 ...prev,
                                 trainQa: newAll.slice(0, sp),
                                 valQa: newAll.slice(sp),
@@ -813,7 +814,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                             // 保持比例重算 split
                             const ratio = editingTemplate.splitRatio ?? 0.8
                             const newSp = Math.ceil(newAll.length * ratio)
-                            setEditingTemplate(prev => ({
+                            updateEditingTemplate(prev => ({
                               ...prev,
                               trainQa: newAll.slice(0, newSp),
                               valQa: newAll.slice(newSp),
@@ -831,7 +832,7 @@ export default function TemplateLibrary({ allTemplates }: TemplateLibraryProps) 
                       const allQa = [...editingTemplate.trainQa, ...editingTemplate.valQa, { question: '', answers: [''] }]
                       const ratio = editingTemplate.splitRatio ?? 0.8
                       const newSp = Math.ceil(allQa.length * ratio)
-                      setEditingTemplate(prev => ({
+                      updateEditingTemplate(prev => ({
                         ...prev,
                         trainQa: allQa.slice(0, newSp),
                         valQa: allQa.slice(newSp),

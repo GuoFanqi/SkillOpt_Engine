@@ -158,7 +158,7 @@ export default function AccountSwitcher({ isOpen, onClose, onAddAccount }: Props
                 </div>
                 <div className="text-left">
                   <div className="text-[15px] font-medium">切换访客模式</div>
-                  <div className="text-[11px] text-gray-400">查看所有公开训练</div>
+                  <div className="text-[11px] text-gray-400">浏览公开模板和案例</div>
                 </div>
               </button>
             ) : (

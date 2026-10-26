@@ -6,7 +6,8 @@ import {
   Eye, Lightbulb, Scale, Ban, ThumbsUp, ThumbsDown, ListChecks,
   BookOpen, Wrench, Sparkles, HelpCircle,
 } from 'lucide-react'
-import { StepHistory } from '../types'
+import { StepHistory, RunState } from '../types'
+import { runStateLabel } from '../lib/runState'
 import {
   LineChart, Line, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -20,6 +21,7 @@ interface PipelineStagesProps {
   totalSteps: number
   isActive: boolean
   history: StepHistory[]
+  state?: RunState
 }
 
 const PIPELINE_STAGES = [
@@ -32,39 +34,15 @@ const PIPELINE_STAGES = [
   { key: 'gate', label: 'Gate', Icon: ShieldCheck, desc: '质量门控：候选分数 > 当前分数 → 接受，否则拒绝' },
 ]
 
-export default function PipelineStages({ runId: _runId, status, totalSteps: _totalSteps, isActive, history }: PipelineStagesProps) {
+export default function PipelineStages({ runId, status, isActive, history, state }: PipelineStagesProps) {
   const [expandedSubStage, setExpandedSubStage] = useState<string | null>(null)
-  const { messages } = useWebSocket()
-  const [latestTiming, setLatestTiming] = useState<Record<string, number>>({})
+  const { timings } = useWebSocket()
+  const latestTiming = state?.timing ?? timings[runId] ?? {}
   const [showTiming, setShowTiming] = useState(false)
-
-  // Listen for timing WebSocket messages
-  useEffect(() => {
-    const lastMsg = messages[messages.length - 1]
-    if (lastMsg?.type === 'timing' && lastMsg.data && typeof lastMsg.data === 'object') {
-      setLatestTiming(lastMsg.data as Record<string, number>)
-    }
-  }, [messages])
-
-  const currentStage = useMemo(() => {
-    if (status === 'completed') return 'gate'
-    if (status === 'failed' || !isActive) return null
-    if (history.length > 0) {
-      const latest = history[history.length - 1]
-      // Each step goes: rollout → reflect → aggregate → select → update(+gate)
-      // update & gate are atomic (happen together in one decision), so show them as one unit
-      if (latest.rollout_hard != null && latest.n_patches == null) return 'rollout'
-      if (latest.n_patches != null && latest.selection_hard == null) return 'reflect'
-      if (latest.selection_hard != null && latest.action === undefined) return 'select'
-      // When action is set (accept/reject/skip), but training is still active,
-      // it means we're starting a new epoch, so show rollout instead of gate
-      if (latest.action != null) {
-        return isActive ? 'rollout' : 'gate'
-      }
-      return 'gate'
-    }
-    return 'baseline'
-  }, [status, isActive, history])
+  const currentStage = status === 'completed' ? 'gate'
+    : !isActive || !state ? null
+    : state.phase === 'validation' ? 'gate' : state.phase
+  const finalPhase = !!state && ['final_validation', 'baseline_test', 'best_test', 'final_test', 'finalizing'].includes(state.phase)
 
   const currentSubIdx = currentStage ? PIPELINE_STAGES.findIndex((s) => s.key === currentStage) : -1
   const isBaseline = currentStage === 'baseline'
@@ -90,7 +68,6 @@ export default function PipelineStages({ runId: _runId, status, totalSteps: _tot
   const initialScore = (!isNaN(trueBaseline) && trueBaseline > 0) ? trueBaseline : (
     sortedHistory.length > 0 ? getStepScore(sortedHistory[0]) : NaN
   )
-  const currentEpoch = history.length > 0 ? Math.max(...history.map(h => h.epoch)) : 0
 
   // 最佳分数（安全处理，防止 Math.max(-Infinity)）
   const validScores = useMemo(() =>
@@ -162,19 +139,13 @@ export default function PipelineStages({ runId: _runId, status, totalSteps: _tot
               耗时
             </button>
           )}
-          {isActive && currentStage && (
+          {state ? (
             <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-xs font-medium">
-              <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
-              {isBaseline ? '基线评估中' : currentEpoch > 0 ? `Epoch ${currentEpoch}` : '初始化中'}
+              <span className={`w-1.5 h-1.5 rounded-full bg-indigo-500 ${isActive ? 'animate-pulse' : ''}`} />
+              {runStateLabel(state)}
             </span>
-          )}
-          {status === 'completed' && (
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-50 text-emerald-600 rounded-full text-xs font-medium">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> 已完成
-            </span>
-          )}
-          {!isActive && status !== 'completed' && (
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-gray-50 text-gray-500 rounded-full text-xs font-medium">待开始</span>
+          ) : (
+            <span className="text-xs text-gray-500">{status === 'completed' ? '已完成（历史记录）' : isActive ? '等待真实阶段同步' : status === 'failed' ? '训练失败' : status === 'stopped' ? '已停止' : '待开始'}</span>
           )}
         </div>
       </div>
@@ -202,7 +173,7 @@ export default function PipelineStages({ runId: _runId, status, totalSteps: _tot
             const isBaselineStage = ss.key === 'baseline'
             
             let isSubDone = false
-            if (status === 'completed') {
+            if (status === 'completed' || finalPhase) {
               isSubDone = true
             } else if (isBaselineStage) {
               // Baseline永远是完成的

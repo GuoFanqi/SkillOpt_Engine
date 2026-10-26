@@ -23,6 +23,7 @@ interface Notification {
 export default function Layout() {
   const location = useLocation()
   const navigate = useNavigate()
+  const { user, token, logout, isAdmin, savedAccounts, switchToGuest } = useAuth()
 
   const isActive = (path: string) => {
     if (path === '/' && location.pathname === '/') return true
@@ -38,36 +39,38 @@ export default function Layout() {
   const searchRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout>>()
+  const searchRequest = useRef<AbortController | null>(null)
+  const searchVersion = useRef(0)
 
   const handleSearch = useCallback((query: string) => {
     setSearchValue(query)
-    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current)
-
-    if (!query.trim()) {
+    clearTimeout(searchTimeoutRef.current)
+    searchRequest.current?.abort()
+    const version = ++searchVersion.current
+    if (!token || !query.trim()) {
       setSearchResults([])
       setShowSearchDropdown(false)
       return
     }
-
     searchTimeoutRef.current = setTimeout(async () => {
+      const controller = new AbortController()
+      searchRequest.current = controller
       setIsSearching(true)
       try {
-        const allRuns = await fetchTrainingRuns()
+        const allRuns = await fetchTrainingRuns(controller.signal)
+        if (controller.signal.aborted || searchVersion.current !== version) return
         const q = query.toLowerCase()
-        const filtered = allRuns.filter(r =>
-          r.name.toLowerCase().includes(q) ||
-          r.model?.toLowerCase().includes(q) ||
-          r.id.toLowerCase().includes(q)
-        )
+        const filtered = allRuns.filter(run => run.name.toLowerCase().includes(q)
+          || run.model?.toLowerCase().includes(q) || run.id.toLowerCase().includes(q))
         setSearchResults(filtered.slice(0, 8))
         setShowSearchDropdown(filtered.length > 0)
       } catch {
-        setSearchResults([])
+        if (!controller.signal.aborted && searchVersion.current === version) setSearchResults([])
       } finally {
-        setIsSearching(false)
+        if (searchVersion.current === version) setIsSearching(false)
       }
     }, 300)
-  }, [])
+  }, [token])
 
   const handleSearchKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && searchValue.trim()) {
@@ -91,46 +94,61 @@ export default function Layout() {
   }, [])
 
   // ─── Notification bell ───
-  const { messages } = useWebSocket()
+  const { states } = useWebSocket()
+  const seenStatuses = useRef<Record<string, string>>({})
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [showNotifications, setShowNotifications] = useState(false)
   const [expandedNotifId, setExpandedNotifId] = useState<string | null>(null)
   const notifRef = useRef<HTMLDivElement>(null)
 
-  // Listen to WebSocket messages and create notifications
   useEffect(() => {
-    const lastMsg = messages[messages.length - 1]
-    if (!lastMsg) return
-
-    if (lastMsg.type === 'complete' || lastMsg.type === 'error') {
-      const isError = lastMsg.code !== 0 || lastMsg.type === 'error'
-      const rawError = typeof lastMsg.error === 'string' ? lastMsg.error : 
-                       typeof lastMsg.data === 'string' ? lastMsg.data : ''
-      // Extract meaningful error: last lines of traceback or key error message
-      const errorLines = rawError.split('\n').filter(Boolean)
-      const shortError = errorLines.length > 0 
-        ? (errorLines.find((l: string) => l.toLowerCase().includes('error:')) || errorLines[errorLines.length - 1] || rawError).slice(0, 120)
-        : '未知错误'
-      
-      const notif: Notification = {
-        id: `${Date.now()}-${lastMsg.runId}`,
-        type: isError ? 'error' : 'complete',
-        runId: lastMsg.runId,
-        message: isError
-          ? `训练出错: ${shortError}`
-          : '训练已完成',
-        fullError: isError ? rawError : '',
+    const added: Notification[] = []
+    for (const [runId, state] of Object.entries(states)) {
+      const key = `${state.instanceId}:${state.status}:${state.artifactSync}`
+      const previous = seenStatuses.current[runId]
+      seenStatuses.current[runId] = key
+      if (!previous || previous === key) continue
+      const failedSync = state.status === 'completed' && state.artifactSync === 'failed'
+      const reachedTerminal = ['completed', 'failed', 'stopped'].includes(state.status)
+        && !previous.startsWith(`${state.instanceId}:${state.status}:`)
+      if (!failedSync && !reachedTerminal) continue
+      const error = failedSync ? state.artifactError : state.error
+      added.push({
+        id: key,
+        type: failedSync || state.status === 'failed' ? 'error' : 'complete',
+        runId,
+        message: failedSync ? '计算已完成，详情同步失败，原件保留'
+          : state.status === 'stopped' ? '训练已停止'
+          : state.status === 'failed' ? `训练失败：${error || '请查看日志'}` : '训练与评测已完成',
+        fullError: error,
         time: Date.now(),
         read: false,
-      }
-      setNotifications(prev => [notif, ...prev].slice(0, 20))
-      setShowNotifications(true)
-
-      // Auto-dismiss notification panel after 5 seconds
-      const timer = setTimeout(() => setShowNotifications(false), 5000)
-      return () => clearTimeout(timer)
+      })
     }
-  }, [messages])
+    if (!added.length) return
+    setNotifications(previous => [...added, ...previous].slice(0, 20))
+    setShowNotifications(true)
+    const timer = setTimeout(() => setShowNotifications(false), 5000)
+    return () => clearTimeout(timer)
+  }, [states])
+
+  useEffect(() => {
+    searchVersion.current++
+    clearTimeout(searchTimeoutRef.current)
+    searchRequest.current?.abort()
+    setSearchValue('')
+    setSearchResults([])
+    setShowSearchDropdown(false)
+    setIsSearching(false)
+    setNotifications([])
+    setShowNotifications(false)
+    seenStatuses.current = {}
+    return () => {
+      searchVersion.current++
+      clearTimeout(searchTimeoutRef.current)
+      searchRequest.current?.abort()
+    }
+  }, [token])
 
   // Close notification dropdown on outside click
   useEffect(() => {
@@ -155,7 +173,6 @@ export default function Layout() {
   const contactRef = useRef<HTMLDivElement>(null)
 
   // ─── Auth ───
-  const { user, logout, isAdmin, savedAccounts, switchToGuest } = useAuth()
   const [showAuthModal, setShowAuthModal] = useState(false)
   const [authDefaultMode, setAuthDefaultMode] = useState<'login' | 'register'>('login')
   const [showAccountSwitcher, setShowAccountSwitcher] = useState(false)
@@ -503,7 +520,7 @@ export default function Layout() {
                   className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all
                     bg-white border-gray-200 text-gray-500 hover:border-gray-300 hover:bg-gray-50 hover:text-gray-700
                     active:scale-95"
-                  title="切换访客模式 — 查看所有公开训练"
+                  title="切换访客模式 — 浏览公开模板和案例"
                 >
                   <EyeOff className="w-3.5 h-3.5 flex-shrink-0" />
                   <span className="hidden sm:inline whitespace-nowrap">切为访客</span>
@@ -588,7 +605,7 @@ export default function Layout() {
           <div className="max-w-7xl mx-auto flex items-center justify-between">
             <div className="flex items-center gap-2 text-sm text-gray-500">
               <Eye className="w-4 h-4" />
-              <span>当前为访客模式 — 仅可浏览公开训练和模板库</span>
+              <span>当前为访客模式 — 仅可浏览公开模板和案例库</span>
             </div>
             {savedAccounts.length > 0 && (
               <button
@@ -605,7 +622,7 @@ export default function Layout() {
       {/* Main Content */}
       <main className="p-8">
         <div className="max-w-7xl mx-auto">
-          <Outlet />
+          <Outlet key={token ?? 'guest'} />
         </div>
       </main>
 

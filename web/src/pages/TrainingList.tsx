@@ -1,12 +1,14 @@
 import { Link, useSearchParams } from 'react-router-dom'
 import { RefreshCw, TrendingUp, CheckCircle, Clock, XCircle, Layers, Download, GitCompare, StopCircle, Trash2, Loader2, X } from 'lucide-react'
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { fetchTrainingRuns, deleteTraining, stopTraining, fetchSkillContent } from '../services/api'
 import { useAuth } from '../contexts/AuthContext'
 import { TrainingRun } from '../types'
 import { useToast } from '../components/Toast'
 import { useConfirm } from '../components/ConfirmDialog'
 import { ListSkeleton } from '../components/Loading'
+import { useWebSocket } from '../hooks/useWebSocket'
+import { applyRunState, mergeTrainingRuns, needsRunRefresh, runStateLabel } from '../lib/runState'
 
 function formatDate(iso: string): string {
   const d = new Date(iso)
@@ -32,6 +34,10 @@ export default function TrainingList() {
   const { showToast } = useToast()
   const { confirm } = useConfirm()
   const [searchParams] = useSearchParams()
+  const { states, connectionVersion } = useWebSocket()
+  const statesRef = useRef(states)
+  statesRef.current = states
+  const requestRef = useRef<AbortController | null>(null)
 
   // Read search query from URL param (set by global search in Layout)
   useEffect(() => {
@@ -40,15 +46,19 @@ export default function TrainingList() {
   }, [searchParams])
 
   const loadData = useCallback(async () => {
+    if (requestRef.current) return
+    const controller = new AbortController()
+    requestRef.current = controller
     try {
-      const data = await fetchTrainingRuns()
-      setRuns(data)
+      const data = await fetchTrainingRuns(controller.signal)
+      if (!controller.signal.aborted) setRuns(previous => mergeTrainingRuns(previous, data, statesRef.current))
     } catch (error) {
-      console.error('Failed to load runs:', error)
+      if (!controller.signal.aborted) showToast('error', error instanceof Error ? error.message : '读取训练列表失败')
     } finally {
-      setLoading(false)
+      if (requestRef.current === controller) requestRef.current = null
+      if (!controller.signal.aborted) setLoading(false)
     }
-  }, [token])
+  }, [token, showToast])
 
   const handleStop = async (runId: string, runName: string) => {
     await stopTraining(runId)
@@ -87,14 +97,29 @@ export default function TrainingList() {
     }
   }
 
-  useEffect(() => { loadData() }, [loadData])
+  useEffect(() => {
+    void loadData()
+    return () => { requestRef.current?.abort(); requestRef.current = null }
+  }, [loadData, connectionVersion])
+
+  useEffect(() => {
+    setRuns(previous => previous.map(run => applyRunState(run, states[run.id])))
+  }, [states])
+
+  const shouldRefresh = runs.some(needsRunRefresh)
+  useEffect(() => {
+    if (!shouldRefresh) return
+    const interval = setInterval(loadData, 3000)
+    return () => clearInterval(interval)
+  }, [shouldRefresh, loadData])
 
   const filtered = runs.filter(r =>
     !search || r.name.toLowerCase().includes(search.toLowerCase())
   )
 
-  const getStatusBadge = (status: TrainingRun['status']) => {
-    switch (status) {
+  const getStatusBadge = (run: TrainingRun) => {
+    if (run.state) return <span className="badge bg-blue-50 text-blue-700">{runStateLabel(run.state)}</span>
+    switch (run.status) {
       case 'completed': return <span className="badge bg-green-50 text-green-600 border border-green-100">已完成</span>
       case 'training': return <span className="badge bg-blue-50 text-blue-600 border border-blue-100">训练中</span>
       case 'failed': return <span className="badge bg-red-50 text-red-600 border border-red-100">失败</span>
@@ -168,7 +193,7 @@ export default function TrainingList() {
                       >
                         {run.name}
                       </Link>
-                      {getStatusBadge(run.status)}
+                      {getStatusBadge(run)}
                     </div>
                     <div className="flex items-center gap-6 text-sm text-gray-500 flex-wrap">
                       <span className="flex items-center gap-1">

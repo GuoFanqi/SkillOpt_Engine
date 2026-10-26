@@ -9,6 +9,8 @@ from skillopt.envs.docvqa.evaluator import evaluate
 from skillopt.model import chat_target_messages, get_target_backend, is_target_exec_backend
 from skillopt.model.codex_harness import prepare_workspace, render_skill_md, run_target_exec
 from skillopt.prompts import load_prompt
+from skillopt.utils.rollout_cache import prepare_rollout_cache
+from skillopt.utils.scoring import ensure_complete_evaluation
 
 
 def _build_system(skill_content: str) -> str:
@@ -255,6 +257,7 @@ def process_one(
             json.dump(conversation, f, ensure_ascii=False, indent=2)
     except Exception as e:  # noqa: BLE001
         result["fail_reason"] = f"error: {e}"
+        result["execution_error"] = True
     return result
 
 
@@ -273,23 +276,17 @@ def run_batch(
     task_timeout: int = 600,
 ) -> list[dict]:
     task_timeout = max(int(task_timeout), int(exec_timeout) + 60)
-    results_path = os.path.join(out_root, "results.jsonl")
-    os.makedirs(out_root, exist_ok=True)
-
-    done_ids: set[str] = set()
-    existing: list[dict] = []
-    if os.path.exists(results_path):
-        with open(results_path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                done_ids.add(str(row["id"]))
-                existing.append(row)
-
-    pending = [item for item in items if str(item["id"]) not in done_ids]
+    results_path, existing, pending = prepare_rollout_cache(
+        out_root, items, skill_content,
+        {
+            "environment": "docvqa", "max_turns": max_turns,
+            "exec_timeout": exec_timeout, "task_timeout": task_timeout,
+            "image_detail": image_detail, "max_completion_tokens": max_completion_tokens,
+            "diagnostic_mode": diagnostic_mode, "diagnostic_instruction": diagnostic_instruction,
+        },
+    )
     if not pending:
+        ensure_complete_evaluation(existing)
         return existing
 
     def _timeout_result(item: dict) -> dict:
@@ -388,4 +385,5 @@ def run_batch(
                     outf.flush()
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
+    ensure_complete_evaluation(results)
     return results

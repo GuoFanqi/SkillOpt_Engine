@@ -13,29 +13,19 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from skillopt.envs.searchqa.evaluator import evaluate
 from skillopt.model import chat_target, is_target_exec_backend
 from skillopt.model.codex_harness import prepare_workspace, render_skill_md, run_target_exec
 from skillopt.prompts import load_prompt
+from skillopt.utils.constraints import validate_forbidden_terms
+from skillopt.utils.rollout_cache import prepare_rollout_cache
+from skillopt.utils.scoring import ensure_complete_evaluation
 
 # ── Prompt templates ─────────────────────────────────────────────────────────
 
 _MAX_CONTEXT_CHARS = 6000
-
-
-def _raise_on_systemic_failure(results: list[dict]) -> None:
-    """Abort when all rollout rows failed before any agent response."""
-    if not results or not all(row.get("agent_ok") is False for row in results):
-        return
-    reasons = Counter(str(row.get("fail_reason") or "unknown error") for row in results)
-    common_reason, count = reasons.most_common(1)[0]
-    raise RuntimeError(
-        f"SearchQA rollout failed for all {len(results)} items before an agent "
-        f"response ({count}x): {common_reason}"
-    )
 
 
 def _truncate_context(context: str, max_chars: int = _MAX_CONTEXT_CHARS) -> str:
@@ -183,6 +173,7 @@ def process_one(
     question = item["question"]
     context = item.get("context", "")
     gold_answers = item.get("answers", [])
+    forbidden_terms = validate_forbidden_terms(item["forbidden_terms"]) if "forbidden_terms" in item else None
 
     result = {
         "id": item_id,
@@ -239,14 +230,19 @@ def process_one(
             with open(os.path.join(pred_dir, "conversation.json"), "w") as f:
                 json.dump(conversation, f, ensure_ascii=False, indent=2)
 
-            eval_result = evaluate(response, gold_answers)
+            eval_result = evaluate(response, gold_answers, forbidden_terms)
             result["em"] = eval_result["em"]
             result["f1"] = eval_result["f1"]
             result["sub_em"] = eval_result["sub_em"]
             result["predicted_answer"] = eval_result["predicted_answer"]
-            result["hard"] = int(eval_result["em"])
-            result["soft"] = eval_result["f1"]
-            if eval_result["em"] < 1.0:
+            result["hard"] = eval_result.get("hard", int(eval_result["em"]))
+            result["soft"] = eval_result.get("soft", eval_result["f1"])
+            if forbidden_terms is not None:
+                result["constraint_passed"] = eval_result["constraint_passed"]
+                result["constraint_violations"] = eval_result["constraint_violations"]
+            if not eval_result.get("constraint_passed", True):
+                result["fail_reason"] = f"constraint-violation: {eval_result['constraint_violations']}"
+            elif eval_result["em"] < 1.0:
                 result["fail_reason"] = (
                     f"EM=0: predicted '{eval_result['predicted_answer']}' "
                     f"but expected {gold_answers}"
@@ -317,15 +313,20 @@ def process_one(
             json.dump(conversation, f, ensure_ascii=False, indent=2)
 
         # Evaluate
-        eval_result = evaluate(response, gold_answers)
+        eval_result = evaluate(response, gold_answers, forbidden_terms)
         result["em"] = eval_result["em"]
         result["f1"] = eval_result["f1"]
         result["sub_em"] = eval_result["sub_em"]
         result["predicted_answer"] = eval_result["predicted_answer"]
-        result["hard"] = int(eval_result["em"])
-        result["soft"] = eval_result["f1"]
+        result["hard"] = eval_result.get("hard", int(eval_result["em"]))
+        result["soft"] = eval_result.get("soft", eval_result["f1"])
+        if forbidden_terms is not None:
+            result["constraint_passed"] = eval_result["constraint_passed"]
+            result["constraint_violations"] = eval_result["constraint_violations"]
 
-        if eval_result["em"] < 1.0:
+        if not eval_result.get("constraint_passed", True):
+            result["fail_reason"] = f"constraint-violation: {eval_result['constraint_violations']}"
+        elif eval_result["em"] < 1.0:
             result["fail_reason"] = (
                 f"EM=0: predicted '{eval_result['predicted_answer']}' "
                 f"but expected {gold_answers}"
@@ -350,6 +351,7 @@ def process_one(
 
     except Exception as e:  # noqa: BLE001
         result["fail_reason"] = f"error: {e}"
+        result["execution_error"] = True
 
     return result
 
@@ -372,25 +374,18 @@ def run_batch(
 ) -> list[dict]:
     """Run QA agent on all items with ThreadPoolExecutor. Resume-aware."""
     task_timeout = max(int(task_timeout), int(exec_timeout) + 60)
-    results_path = os.path.join(out_root, "results.jsonl")
-    os.makedirs(out_root, exist_ok=True)
-
-    # Resume: load already-done
-    done_ids: set[str] = set()
-    existing: list[dict] = []
-    if os.path.exists(results_path):
-        with open(results_path) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    done_ids.add(str(r["id"]))
-                    existing.append(r)
-                except Exception:
-                    pass
-
-    pending = [it for it in items if str(it["id"]) not in done_ids]
+    results_path, existing, pending = prepare_rollout_cache(
+        out_root, items, skill_content,
+        {
+            "environment": "searchqa", "max_turns": max_turns,
+            "exec_timeout": exec_timeout, "task_timeout": task_timeout,
+            "max_completion_tokens": max_completion_tokens,
+            "diagnostic_mode": diagnostic_mode, "diagnostic_instruction": diagnostic_instruction,
+            "diagnostic_trace_context_by_id": diagnostic_trace_context_by_id,
+        },
+    )
     if not pending:
-        _raise_on_systemic_failure(existing)
+        ensure_complete_evaluation(existing)
         return existing
 
     total = len(existing) + len(pending)
@@ -490,5 +485,5 @@ def run_batch(
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
 
-    _raise_on_systemic_failure(results)
+    ensure_complete_evaluation(results)
     return results

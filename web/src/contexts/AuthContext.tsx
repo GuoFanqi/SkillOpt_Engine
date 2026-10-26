@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
 
-const API_BASE = 'http://localhost:3002/api'
+import { API_BASE } from '../lib/endpoints'
 
 interface Account { phone: string; token: string; userId: number; isAdmin?: boolean; lastLoginAt?: number }
 interface User { id: number; phone: string; is_admin?: number }
@@ -41,43 +41,53 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true)
   const [guestMode, setGuestMode] = useState(false)
 
-  // Periodically sync saved accounts from localStorage (for other tabs)
   useEffect(() => {
-    const sync = () => setSavedAccounts(loadAccounts())
+    const sync = (event: StorageEvent) => {
+      if (event.key === 'skillopt_accounts') setSavedAccounts(loadAccounts())
+      if (event.key === 'skillopt_token') {
+        setUser(null)
+        setGuestMode(!event.newValue)
+        setLoading(!!event.newValue)
+        setToken(event.newValue)
+      }
+    }
     window.addEventListener('storage', sync)
     return () => window.removeEventListener('storage', sync)
   }, [])
 
-  // Verify current token or auto-login first saved account
   useEffect(() => {
+    const controller = new AbortController()
+    let disposed = false
     if (token) {
-      // Verify existing token
-      fetch(`${API_BASE}/auth/me`, { headers: { Authorization: `Bearer ${token}` } })
-        .then(r => r.ok ? r.json() : Promise.reject())
+      setLoading(true)
+      localStorage.setItem('skillopt_token', token)
+      fetch(`${API_BASE}/auth/me`, { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal })
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('登录已过期')))
         .then(u => {
+          if (disposed) return
           setUser(u)
           setGuestMode(false)
-          localStorage.setItem('skillopt_token', token)
           setLoading(false)
         })
         .catch(() => {
+          if (disposed) return
           localStorage.removeItem('skillopt_token')
-          // Try next saved account
           const accounts = loadAccounts().filter(a => a.token !== token)
           saveAccounts(accounts)
           setSavedAccounts(accounts)
+          setUser(null)
           if (accounts.length > 0) {
+            localStorage.setItem('skillopt_token', accounts[0].token)
             setToken(accounts[0].token)
           } else {
             setToken(null)
-            setUser(null)
             setLoading(false)
           }
         })
     } else if (!guestMode) {
-      // No token — try auto-login with first saved account (unless in guest mode)
       const accounts = loadAccounts()
       if (accounts.length > 0) {
+        localStorage.setItem('skillopt_token', accounts[0].token)
         setToken(accounts[0].token)
       } else {
         setLoading(false)
@@ -85,6 +95,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } else {
       setLoading(false)
     }
+    return () => { disposed = true; controller.abort() }
+  }, [token, guestMode])
+
+  useEffect(() => {
+    const expire = (event: Event) => {
+      if ((event as CustomEvent<string>).detail !== token) return
+      const accounts = loadAccounts().filter(account => account.token !== token)
+      saveAccounts(accounts)
+      setSavedAccounts(accounts)
+      localStorage.removeItem('skillopt_token')
+      setGuestMode(true)
+      setToken(null)
+      setUser(null)
+      setLoading(false)
+    }
+    window.addEventListener('skillopt-auth-expired', expire)
+    return () => window.removeEventListener('skillopt-auth-expired', expire)
   }, [token])
 
   const saveCurrentAccount = (newToken: string, newUser: User) => {
@@ -93,6 +120,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     saveAccounts(accounts)
     setSavedAccounts(accounts)
     localStorage.setItem('skillopt_token', newToken)
+    setGuestMode(false)
     setToken(newToken)
     setUser(newUser)
   }
@@ -142,8 +170,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     saveAccounts(accounts)
     setSavedAccounts(accounts)
     localStorage.setItem('skillopt_token', account.token)
+    setLoading(true)
+    setUser(null)
     setToken(account.token)
-    setUser({ id: account.userId, phone: account.phone, is_admin: account.isAdmin ? 1 : 0 })
   }, [])
 
   const removeAccount = useCallback((phone: string) => {
@@ -153,9 +182,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // If removing current account, switch to another or logout
     if (user?.phone === phone) {
       if (accounts.length > 0) {
+        localStorage.setItem('skillopt_token', accounts[0].token)
+        setLoading(true)
+        setUser(null)
         setToken(accounts[0].token)
-        setUser({ id: accounts[0].userId, phone: accounts[0].phone, is_admin: accounts[0].isAdmin ? 1 : 0 })
       } else {
+        localStorage.removeItem('skillopt_token')
         setToken(null)
         setUser(null)
       }
@@ -175,8 +207,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setSavedAccounts(accounts)
     localStorage.removeItem('skillopt_token')
     if (accounts.length > 0) {
+      localStorage.setItem('skillopt_token', accounts[0].token)
+      setLoading(true)
+      setUser(null)
       setToken(accounts[0].token)
-      setUser({ id: accounts[0].userId, phone: accounts[0].phone, is_admin: accounts[0].isAdmin ? 1 : 0 })
     } else {
       setToken(null)
       setUser(null)

@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { FileText, TrendingUp, Search, Layers } from 'lucide-react'
+import { FileText, TrendingUp, Layers } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { fetchTrainingRuns, fetchSkillContent } from '../services/api'
 import { TrainingRun } from '../types'

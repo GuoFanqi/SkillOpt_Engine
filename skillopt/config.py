@@ -25,6 +25,7 @@ import yaml
 _STRUCTURED_SECTIONS = frozenset({
     "model", "train", "gradient", "optimizer", "evaluation", "env",
 })
+_STRUCTURED_METADATA = frozenset({"trainingName"})
 
 # ── Structured → flat key mapping ────────────────────────────────────────
 
@@ -159,7 +160,11 @@ def _load_yaml(path: str, _visited: set[str] | None = None) -> dict:
     _visited.add(abs_path)
 
     with open(abs_path) as f:
-        cfg = yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(f)
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"Config must contain a mapping: {abs_path}")
 
     base_ref = cfg.pop("_base_", None)
     if base_ref:
@@ -175,22 +180,55 @@ def _load_yaml(path: str, _visited: set[str] | None = None) -> dict:
 def is_structured(cfg: dict) -> bool:
     """Return True if *cfg* uses the new structured section format."""
     return any(
-        key in _STRUCTURED_SECTIONS and isinstance(cfg.get(key), dict)
+        key in _STRUCTURED_SECTIONS and (key != "env" or isinstance(cfg.get(key), dict))
         for key in cfg
     )
 
 
 # ── Flatten ──────────────────────────────────────────────────────────────
 
+def _validate_runtime_options(options: dict) -> None:
+    for key in options:
+        if not isinstance(key, str):
+            raise ValueError("Config option names must be strings.")
+        if key.startswith(("optimizer_minimax_", "target_minimax_")):
+            raise ValueError(
+                f"Unsupported MiniMax role option: {key!r}. "
+                "Use the shared minimax_* options for the target backend."
+            )
+    if str(options.get("optimizer_backend", "")).strip().lower() in {"minimax", "minimax_chat"}:
+        raise ValueError("MiniMax optimizer is not implemented; MiniMax is supported only as a target backend.")
+    if "merge_batch_size" in options:
+        size = options["merge_batch_size"]
+        if isinstance(size, bool) or not isinstance(size, int) or size < 2:
+            raise ValueError("merge_batch_size must be an integer >= 2.")
+
+
 def flatten_config(cfg: dict) -> dict:
     """Convert a structured config to the flat dict expected by the trainer.
 
     If *cfg* is already flat, returns a shallow copy unchanged.
     """
+    _validate_runtime_options(cfg)
     if not is_structured(cfg):
         return dict(cfg)
 
     flat: dict[str, Any] = {}
+    for section, options in cfg.items():
+        if section in _STRUCTURED_METADATA:
+            flat[section] = options
+            continue
+        if section not in _STRUCTURED_SECTIONS:
+            dotted = next((name for name, flat_key in _FLATTEN_MAP.items() if flat_key == section), None)
+            hint = f" Use {dotted!r}." if dotted else ""
+            raise ValueError(f"Unknown top-level option in structured config: {section!r}.{hint}")
+        if not isinstance(options, dict):
+            raise ValueError(f"Config section {section!r} must be a mapping.")
+        _validate_runtime_options(options)
+        if section != "env":
+            for key in options:
+                if f"{section}.{key}" not in _FLATTEN_MAP:
+                    raise ValueError(f"Unknown config option: {section + '.' + key!r}.")
 
     # Apply the explicit mapping
     for dotted, flat_key in _FLATTEN_MAP.items():
@@ -211,6 +249,7 @@ def flatten_config(cfg: dict) -> dict:
             if key not in mapped_env_keys:
                 flat[key] = val
 
+    _validate_runtime_options(flat)
     return flat
 
 
@@ -243,16 +282,23 @@ def apply_overrides(cfg: dict, overrides: list[str]) -> None:
         if "=" not in item:
             raise ValueError(f"Invalid override (expected key=value): {item!r}")
         key, val_str = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError("Config override key must not be empty.")
         val = _cast_value(val_str)
+        _validate_runtime_options({key.split(".", 1)[-1]: val})
 
         if "." in key:
             section, subkey = key.split(".", 1)
-            if section in cfg and isinstance(cfg[section], dict):
-                cfg[section][subkey] = val
-            else:
-                cfg.setdefault(section, {})[subkey] = val
+            if not subkey or "." in subkey or (section != "env" and key not in _FLATTEN_MAP):
+                raise ValueError(f"Unknown config option: {key!r}.")
+            if section in cfg and not isinstance(cfg[section], dict):
+                raise ValueError(f"Config section {section!r} must be a mapping.")
+            cfg.setdefault(section, {})[subkey] = val
         else:
-            # Flat key — apply to top level (for legacy compat)
+            if is_structured(cfg):
+                dotted = next((name for name, flat_key in _FLATTEN_MAP.items() if flat_key == key), f"env.{key}")
+                raise ValueError(f"Structured config requires a section-qualified key; use {dotted!r}.")
             cfg[key] = val
 
 

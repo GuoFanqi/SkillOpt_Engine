@@ -35,6 +35,7 @@ export default function Playground() {
   const [inputValue, setInputValue] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [abortHandle, setAbortHandle] = useState<{ abort: () => void } | null>(null)
+  useEffect(() => () => abortHandle?.abort(), [abortHandle])
   const [expandedThinking, setExpandedThinking] = useState<Set<number>>(new Set())
 
   const [selectedModel, setSelectedModel] = useState('deepseek-reasoner')

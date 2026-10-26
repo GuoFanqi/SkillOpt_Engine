@@ -26,12 +26,14 @@ import {
   fetchEvalDetails,
   generateAISummaryStream,
   askAIChat,
+  readAIStream,
 } from '../services/api'
 import type { EvalSummary, EvalDetail } from '../services/api'
-import { TrainingRun, StepHistory, ChartDataPoint, TrainingConfig, SkillVersion, TrainingData, RolloutResult, MergedPatch } from '../types'
+import { TrainingRun, StepHistory, ChartDataPoint, SkillVersion, TrainingData, RolloutResult, MergedPatch } from '../types'
 import PipelineStages from '../components/PipelineStages'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { DetailSkeleton } from '../components/Loading'
+import { applyRunState, mergeTrainingRun, needsRunRefresh, runStateLabel } from '../lib/runState'
 
 const tabs = ['概览', '日志', '历史', '步骤', '评估', '数据', '技能']
 
@@ -43,7 +45,7 @@ export default function TrainingDetail() {
   const [run, setRun] = useState<TrainingRun | null>(null)
   const [history, setHistory] = useState<StepHistory[]>([])
   const [chartData, setChartData] = useState<ChartDataPoint[]>([])
-  const [config, setConfig] = useState<TrainingConfig | null>(null)
+  const [loadError, setLoadError] = useState('')
   const [activeTab, setActiveTab] = useState('概览')
   const [loading, setLoading] = useState(true)
   const [diffModalStep, setDiffModalStep] = useState<StepHistory | null>(null)
@@ -53,7 +55,17 @@ export default function TrainingDetail() {
   const [allRuns, setAllRuns] = useState<TrainingRun[]>([])
 
   // WebSocket 实时更新
-  const { messages } = useWebSocket()
+  const { messages, states, connectionVersion } = useWebSocket()
+  const statesRef = useRef(states)
+  statesRef.current = states
+  const requestRef = useRef<AbortController | null>(null)
+  const pendingRef = useRef<Promise<void> | null>(null)
+  const stateRequestRef = useRef<AbortController | null>(null)
+  const refreshQueued = useRef(false)
+  const seenLogId = useRef(0)
+  const lastDetailState = useRef('')
+  const evalRequestRef = useRef<AbortController | null>(null)
+  const streamRequests = useRef(new Set<AbortController>())
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const logEndRef = useRef<HTMLDivElement>(null)
   const [consoleLines, setConsoleLines] = useState<Array<{ text: string; time: string; type: 'stdout' | 'stderr' }>>([])
@@ -71,39 +83,25 @@ export default function TrainingDetail() {
     setShowChat(true)
     setChatMessages(prev => [...prev, { role: 'user', content: question }])
     setChatStreaming(true)
-    const decodedId = decodeURIComponent(id)
+    const controller = new AbortController()
+    streamRequests.current.add(controller)
     try {
-      const resp = await askAIChat(decodedId, question)
-      if (!resp.ok || !resp.body) { setChatStreaming(false); return }
-      const reader = resp.body.getReader()
-      const decoder = new TextDecoder()
-      let fullText = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        const chunk = decoder.decode(value, { stream: true })
-        const lines = chunk.split('\n').filter(l => l.startsWith('data: '))
-        for (const line of lines) {
-          try {
-            const data = JSON.parse(line.slice(6))
-            if (data.done) {
-              setChatStreaming(false)
-              // Just update the last assistant message — don't push a second one
-              if (fullText) {
-                setChatMessages(prev => {
-                  const copy = [...prev]
-                  const last = copy[copy.length - 1]
-                  if (last?.role === 'assistant') copy[copy.length - 1] = { ...last, content: fullText }
-                  return copy
-                })
-              }
-            }
-            else if (data.text) { fullText += data.text; setChatMessages(prev => { const copy = [...prev]; const last = copy[copy.length - 1]; if (last?.role === 'assistant' && !data.done) copy[copy.length - 1] = { ...last, content: fullText }; else copy.push({ role: 'assistant', content: fullText }); return copy }) }
-          } catch {}
-        }
-      }
-    } catch { setChatStreaming(false) }
-  }, [id, chatInput, chatStreaming])
+      const response = await askAIChat(decodeURIComponent(id), question, controller.signal)
+      await readAIStream(response, text => {
+        setChatMessages(previous => {
+          const last = previous[previous.length - 1]
+          return last?.role === 'assistant'
+            ? [...previous.slice(0, -1), { role: 'assistant', content: text }]
+            : [...previous, { role: 'assistant', content: text }]
+        })
+      }, controller.signal)
+    } catch (error) {
+      if (!controller.signal.aborted) showToast('error', error instanceof Error ? error.message : '提问失败')
+    } finally {
+      streamRequests.current.delete(controller)
+      if (!controller.signal.aborted) setChatStreaming(false)
+    }
+  }, [id, chatInput, chatStreaming, showToast])
 
   // AI Summary streaming
   const [streamingSummary, setStreamingSummary] = useState('')
@@ -113,44 +111,32 @@ export default function TrainingDetail() {
     if (!id || isStreaming) return
     setIsStreaming(true)
     setStreamingSummary('')
-    const decodedId = decodeURIComponent(id)
+    const controller = new AbortController()
+    streamRequests.current.add(controller)
     try {
-      const resp = await generateAISummaryStream(decodedId)
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({}))
-        setStreamingSummary((err as any)?.error || '生成失败：API Key 未配置或无效')
-        setIsStreaming(false)
-        return
-      }
-      if (!resp.body) { setIsStreaming(false); return }
-      const reader = resp.body.getReader()
-      const decoder = new TextDecoder()
-      let fullText = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        const chunk = decoder.decode(value, { stream: true })
-        const lines = chunk.split('\n').filter(l => l.startsWith('data: '))
-        for (const line of lines) {
-          try {
-            const data = JSON.parse(line.slice(6))
-            if (data.done) { setIsStreaming(false); if (fullText) { setRun(prev => prev ? { ...prev, aiSummary: fullText } : prev) } }
-            else if (data.text) { fullText += data.text; setStreamingSummary(fullText) }
-          } catch {}
-        }
-      }
-    } catch { setIsStreaming(false) }
+      const response = await generateAISummaryStream(decodeURIComponent(id), controller.signal)
+      const summary = await readAIStream(response, setStreamingSummary, controller.signal)
+      if (!controller.signal.aborted) setRun(previous => previous ? { ...previous, aiSummary: summary } : previous)
+    } catch (error) {
+      if (!controller.signal.aborted) setStreamingSummary(error instanceof Error ? error.message : '生成总结失败')
+    } finally {
+      streamRequests.current.delete(controller)
+      if (!controller.signal.aborted) setIsStreaming(false)
+    }
   }, [id, isStreaming])
   useEffect(() => {
-    if (!id) { setConsoleLines([]); return }
-    const decodedId = decodeURIComponent(id)
-    fetchTrainingLogs(decodedId).then(logs => {
-      setConsoleLines(logs.map(l => ({
-        text: l.text,
-        time: new Date(l.created_at).toLocaleTimeString('zh-CN', { hour12: false }),
-        type: l.type,
-      })))
+    setConsoleLines([])
+    if (!id) return
+    const controller = new AbortController()
+    fetchTrainingLogs(decodeURIComponent(id), 500, controller.signal).then(logs => {
+      if (controller.signal.aborted) return
+      setConsoleLines(previous => [...logs.map(log => ({
+        text: log.text,
+        time: new Date(log.created_at).toLocaleTimeString('zh-CN', { hour12: false }),
+        type: log.type,
+      })), ...previous].slice(-500))
     }).catch(() => {})
+    return () => controller.abort()
   }, [id])
 
   // Evaluation data
@@ -160,111 +146,151 @@ export default function TrainingDetail() {
   const [selectedEvalPhase, setSelectedEvalPhase] = useState<string>('')
   const [expandedEvalId, setExpandedEvalId] = useState<number | null>(null)
 
-  useEffect(() => {
-    if (!id) return
-    const decodedId = decodeURIComponent(id)
-    fetchEvalSummary(decodedId).then(setEvalSummary).catch(() => {})
-  }, [id])
-
   const loadEvalDetails = (step: number, phase: string) => {
     if (!id) return
-    const decodedId = decodeURIComponent(id)
+    evalRequestRef.current?.abort()
+    const controller = new AbortController()
+    evalRequestRef.current = controller
     setSelectedEvalStep(step)
     setSelectedEvalPhase(phase)
-    fetchEvalDetails(decodedId, step, phase || undefined).then(setEvalDetails).catch(() => {})
+    setEvalDetails([])
+    fetchEvalDetails(decodeURIComponent(id), step, phase || undefined, controller.signal)
+      .then(details => { if (!controller.signal.aborted) setEvalDetails(details) })
+      .catch(() => {})
   }
 
-  const loadData = useCallback(async (runId?: string, silent = false) => {
+  const loadData = useCallback((runId?: string, silent = false): Promise<void> => {
     const targetId = runId || id
-    if (!targetId) {
-      setLoading(false)
-      setRun(null)
-      return
+    if (!targetId) { setLoading(false); return Promise.resolve() }
+    if (pendingRef.current) {
+      refreshQueued.current = true
+      return pendingRef.current
     }
     if (!silent) setLoading(true)
-    try {
-      // 始终加载任务列表
-      const runsList = await fetchTrainingRuns()
-      setAllRuns(runsList)
-
-      const decodedId = decodeURIComponent(targetId)
-      const [runData, historyData, chart, configData] = await Promise.all([
-        fetchTrainingRun(decodedId),
-        fetchStepHistory(decodedId).catch(() => [] as StepHistory[]),
-        fetchChartData(decodedId).catch(() => [] as ChartDataPoint[]),
-        fetchTrainingConfig(decodedId).catch(() => null),
-      ])
-      setRun(runData)
+    const controller = new AbortController()
+    requestRef.current = controller
+    const decodedId = decodeURIComponent(targetId)
+    const pending = Promise.all([
+      fetchTrainingRun(decodedId, controller.signal).then(runData => {
+        if (!controller.signal.aborted) {
+          setRun(previous => applyRunState(mergeTrainingRun(previous, runData), statesRef.current[decodedId]))
+          setLoading(false)
+        }
+      }),
+      fetchStepHistory(decodedId, controller.signal),
+      fetchChartData(decodedId, controller.signal),
+      fetchEvalSummary(decodedId, controller.signal),
+    ]).then(([, historyData, chart, evaluations]) => {
+      if (controller.signal.aborted) return
       setHistory(historyData)
       setChartData(chart)
-      setConfig(configData)
+      setEvalSummary(evaluations)
+      setLoadError('')
+    }).catch(error => {
+      if (!controller.signal.aborted) setLoadError(error instanceof Error ? error.message : '读取训练详情失败')
+    }).finally(() => {
+      if (requestRef.current !== controller) return
+      requestRef.current = null
+      pendingRef.current = null
+      if (!controller.signal.aborted) setLoading(false)
+      if (refreshQueued.current && !controller.signal.aborted) {
+        refreshQueued.current = false
+        void loadData(undefined, true)
+      }
+    })
+    pendingRef.current = pending
+    return pending
+  }, [id])
+
+  const refreshState = useCallback(async () => {
+    if (!id || stateRequestRef.current) return
+    const controller = new AbortController()
+    stateRequestRef.current = controller
+    const decodedId = decodeURIComponent(id)
+    try {
+      const incoming = await fetchTrainingRun(decodedId, controller.signal)
+      if (!controller.signal.aborted) {
+        setRun(previous => applyRunState(mergeTrainingRun(previous, incoming), statesRef.current[decodedId]))
+      }
     } catch (error) {
-      console.error('Failed to load data:', error)
-      setRun(null)
+      if (!controller.signal.aborted) setLoadError(error instanceof Error ? error.message : '状态同步失败')
     } finally {
-      if (!silent) setLoading(false)
+      if (stateRequestRef.current === controller) stateRequestRef.current = null
     }
   }, [id])
 
-  // 初始加载 + id 变化时重新加载
   useEffect(() => {
-    loadData()
+    const controller = new AbortController()
+    setRun(null)
+    setHistory([])
+    setChartData([])
+    setEvalDetails([])
+    setEvalSummary([])
+    setChatMessages([])
+    setStreamingSummary('')
+    setLoadError('')
+    lastDetailState.current = ''
+    seenLogId.current = 0
+    void loadData()
+    fetchTrainingRuns(controller.signal).then(data => {
+      if (!controller.signal.aborted) setAllRuns(data)
+    }).catch(() => {})
+    return () => {
+      controller.abort()
+      requestRef.current?.abort()
+      requestRef.current = null
+      pendingRef.current = null
+      refreshQueued.current = false
+      stateRequestRef.current?.abort()
+      stateRequestRef.current = null
+      evalRequestRef.current?.abort()
+      streamRequests.current.forEach(request => request.abort())
+      streamRequests.current.clear()
+    }
   }, [loadData])
 
-  // WebSocket 消息监听：匹配当前 runId 时自动刷新
   useEffect(() => {
-    const lastMsg = messages[messages.length - 1]
-    if (!lastMsg || !id) return
+    if (!id) return
     const decodedId = decodeURIComponent(id)
+    const entries = messages.filter(message => message.id > seenLogId.current && message.runId === decodedId
+      && (message.type === 'log' || message.type === 'error'))
+    seenLogId.current = messages[messages.length - 1]?.id ?? seenLogId.current
+    if (entries.length) setConsoleLines(previous => [...previous, ...entries.map(message => ({
+      text: String(message.data),
+      time: new Date(message.receivedAt).toLocaleTimeString('zh-CN', { hour12: false }),
+      type: message.type === 'error' ? 'stderr' as const : 'stdout' as const,
+    }))].slice(-500))
+  }, [messages, id])
 
-    // Capture log messages for console panel
-    if ((lastMsg.type === 'log' || lastMsg.type === 'error') && lastMsg.runId === decodedId) {
-      const text = typeof lastMsg.data === 'string' ? lastMsg.data : JSON.stringify(lastMsg.data || '')
-      setConsoleLines(prev => [...prev.slice(-500), {
-        text,
-        time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-        type: lastMsg.type === 'error' ? 'stderr' as const : 'stdout' as const
-      }])
-    }
-
-    if (lastMsg.runId !== decodedId) return
-
-    if (lastMsg.type === 'complete') {
-      setTimeout(() => loadData(undefined, true), 1000)
-    } else if (lastMsg.type === 'progress' && lastMsg.data && typeof lastMsg.data === 'object') {
-      // Instant progress update without API call
-      const { step, currentScore, bestScore } = lastMsg.data as { step: number; currentScore: number; bestScore: number }
-      setRun(prev => prev ? {
-        ...prev,
-        totalSteps: step,
-        currentScore,
-        bestScore,
-        status: 'training',
-      } : prev)
-    } else {
-      loadData(undefined, true)
-    }
-  }, [messages, id, loadData])
-
-  // 轮询：训练中时每 3 秒刷新一次
   useEffect(() => {
-    if (run?.status === 'training') {
-      if (!pollRef.current) {
-        pollRef.current = setInterval(() => loadData(undefined, true), 3000)
-      }
-    } else {
-      if (pollRef.current) {
-        clearInterval(pollRef.current)
-        pollRef.current = null
-      }
-    }
+    if (!id) return
+    const state = states[decodeURIComponent(id)]
+    if (state) setRun(previous => previous ? applyRunState(previous, state) : previous)
+  }, [states, id])
+
+  const detailStateKey = run?.state
+    ? `${run.state.attempt}:${run.state.completedSteps}:${run.state.status}:${run.state.artifactSync}:${run.state.status === 'training' ? '' : run.state.version}`
+    : run?.status ?? ''
+  useEffect(() => {
+    if (!detailStateKey || detailStateKey === lastDetailState.current) return
+    const hadState = !!lastDetailState.current
+    lastDetailState.current = detailStateKey
+    if (hadState) void loadData(undefined, true)
+  }, [detailStateKey, loadData])
+
+  useEffect(() => {
+    if (connectionVersion > 0) void loadData(undefined, true)
+  }, [connectionVersion, loadData])
+
+  const shouldRefresh = run ? needsRunRefresh(run) : false
+  useEffect(() => {
+    if (!shouldRefresh) return
+    pollRef.current = setInterval(refreshState, 3000)
     return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current)
-        pollRef.current = null
-      }
+      if (pollRef.current) clearInterval(pollRef.current)
+      pollRef.current = null
     }
-  }, [run?.status, loadData])
+  }, [shouldRefresh, refreshState])
 
   // Auto-scroll log panel
   useEffect(() => {
@@ -385,7 +411,7 @@ export default function TrainingDetail() {
   if (!run && !loading) {
     return (
       <div className="flex flex-col items-center justify-center h-64 gap-4">
-        <div className="text-gray-500">请从仪表盘选择一个训练任务</div>
+        <div className="text-gray-500">{loadError || '请从仪表盘选择一个训练任务'}</div>
         <Link to="/" className="btn-primary">返回仪表盘</Link>
       </div>
     )
@@ -454,16 +480,13 @@ export default function TrainingDetail() {
         </div>
       </div>
 
-      {/* Live status indicator */}
-      {run.status === 'training' && (
-        <div className="mb-3 flex items-center gap-2 text-xs text-blue-600 bg-blue-50 border border-blue-100 rounded-xl px-4 py-2">
-          <span className="relative flex h-2 w-2">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
-          </span>
-          训练进行中 · 每 3 秒自动刷新数据
-        </div>
-      )}
+      <div role="status" className="mb-3 text-sm bg-blue-50 border border-blue-100 rounded-xl px-4 py-3 space-y-1">
+        <p className="font-medium text-blue-700">{run.state ? runStateLabel(run.state) : run.status === 'completed' ? '训练已完成（历史记录）' : run.status === 'failed' ? '训练失败' : run.status === 'stopped' ? '已停止' : '等待真实阶段同步'}</p>
+        {run.state && <p className="text-xs text-gray-600">优化步骤 {run.state.completedSteps}/{run.state.totalSteps} · 状态更新时间 {new Date(run.state.updatedAt).toLocaleTimeString('zh-CN')}</p>}
+        {run.state?.persistenceError && <p className="text-amber-700">状态保存失败，尚未同步：{run.state.persistenceError}</p>}
+        {run.state?.artifactError && <p className="text-amber-700">详情同步失败：{run.state.artifactError}</p>}
+        {loadError && <p className="text-amber-700">{loadError}；当前保留最近一次有效状态。</p>}
+      </div>
 
       {/* AI 总结 */}
       {(run.aiSummary || isStreaming || streamingSummary) ? (
@@ -543,6 +566,7 @@ export default function TrainingDetail() {
         totalSteps={run.totalSteps}
         isActive={run.status === 'training'}
         history={history}
+        state={run.state}
       />
 
       {/* Tabs */}
@@ -712,7 +736,7 @@ export default function TrainingDetail() {
                             <Line type="monotone" dataKey="selection" name="验证集分数" stroke="#6366F1" strokeWidth={2.5}
                               dot={(props: any) => {
                                 const { cx, cy, payload } = props
-                                if (cx == null || cy == null) return null
+                                if (cx == null || cy == null) return <g />
                                 const isAccept = payload.action === 'accept'
                                 const isReject = payload.action === 'reject'
                                 return (
@@ -1359,7 +1383,7 @@ function SkillTabContent({ runId }: { runId: string }) {
     const sorted = [...skills].filter(s => s.version !== 'best' && s.version !== 'initial')
       .sort((a, b) => parseInt(a.version, 10) - parseInt(b.version, 10))
     for (const s of sorted) {
-      if (selectedVersion !== 'best' && parseInt(selectedVersion, 10) > 0 && parseInt(s.version, 10) >= parseInt(selectedVersion, 10)) continue
+      if (selectedVersion && selectedVersion !== 'best' && parseInt(selectedVersion, 10) > 0 && parseInt(s.version, 10) >= parseInt(selectedVersion, 10)) continue
       opts.push({ value: s.version, label: `v${s.version}` })
     }
     return opts

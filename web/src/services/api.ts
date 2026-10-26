@@ -1,7 +1,20 @@
 import { TrainingRun, StepHistory, SkillVersion, ChartDataPoint, TrainingConfig, TrainingData } from '../types'
 import { NewTrainingConfig } from '../components/NewTrainingModal'
 
-const API_BASE = 'http://localhost:3002/api'
+import { API_BASE } from '../lib/endpoints'
+import { CATEGORIES, DEFAULT_CONFIG, DEFAULT_METRICS, type SkillTemplate } from '../data/templates'
+
+async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  const token = localStorage.getItem('skillopt_token')
+  const headers = new Headers(options.headers)
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const response = await window.fetch(url, { ...options, headers })
+  if (localStorage.getItem('skillopt_token') !== token) throw new DOMException('Account changed', 'AbortError')
+  if (response.status === 401 && token) {
+    window.dispatchEvent(new CustomEvent('skillopt-auth-expired', { detail: token }))
+  }
+  return response
+}
 
 const getAuthHeaders = (includeContentType = true): Record<string, string> => {
   const token = localStorage.getItem('skillopt_token')
@@ -19,45 +32,42 @@ const handleApiError = async (res: Response, defaultMessage: string) => {
   return res
 }
 
-export async function fetchTrainingRuns(): Promise<TrainingRun[]> {
-  const res = await fetch(`${API_BASE}/runs`, { headers: getAuthHeaders() })
-  if (!res.ok) throw new Error('Failed to fetch')
+async function readJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await apiFetch(`${API_BASE}${path}`, { signal })
+  await handleApiError(res, '读取失败')
   return res.json()
 }
 
-export async function fetchTrainingRun(id: string): Promise<TrainingRun | null> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(id)}`, { headers: getAuthHeaders() })
-  if (!res.ok) throw new Error('Failed to fetch')
-  return res.json()
+export function fetchTrainingRuns(signal?: AbortSignal): Promise<TrainingRun[]> {
+  return readJson('/runs', signal)
 }
 
-export async function fetchStepHistory(runId: string): Promise<StepHistory[]> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/history`)
-  if (!res.ok) throw new Error('Failed to fetch')
-  return res.json()
+export function fetchTrainingRun(id: string, signal?: AbortSignal): Promise<TrainingRun> {
+  return readJson(`/runs/${encodeURIComponent(id)}`, signal)
 }
 
-export async function fetchChartData(runId: string): Promise<ChartDataPoint[]> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/chart`)
-  if (!res.ok) throw new Error('Failed to fetch')
-  return res.json()
+export function fetchStepHistory(runId: string, signal?: AbortSignal): Promise<StepHistory[]> {
+  return readJson(`/runs/${encodeURIComponent(runId)}/history`, signal)
 }
 
-export async function fetchSkillVersions(runId: string): Promise<SkillVersion[]> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/skills`)
-  if (!res.ok) throw new Error('Failed to fetch')
-  return res.json()
+export function fetchChartData(runId: string, signal?: AbortSignal): Promise<ChartDataPoint[]> {
+  return readJson(`/runs/${encodeURIComponent(runId)}/chart`, signal)
 }
 
-export async function fetchSkillContent(runId: string, version: string): Promise<string> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/skills/${encodeURIComponent(version)}`)
-  if (!res.ok) throw new Error('Failed to fetch')
+export function fetchSkillVersions(runId: string, signal?: AbortSignal): Promise<SkillVersion[]> {
+  return readJson(`/runs/${encodeURIComponent(runId)}/skills`, signal)
+}
+
+export async function fetchSkillContent(runId: string, version: string, signal?: AbortSignal): Promise<string> {
+  const res = await apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/skills/${encodeURIComponent(version)}`, { signal })
+  await handleApiError(res, '读取技能失败')
   return res.text()
 }
 
-export async function fetchCandidateSkill(runId: string, step: number | string): Promise<string> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/candidate-skill`)
-  if (!res.ok) return ''
+export async function fetchCandidateSkill(runId: string, step: number | string, signal?: AbortSignal): Promise<string> {
+  const res = await apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/candidate-skill`, { signal })
+  if (res.status === 404) return ''
+  await handleApiError(res, '读取候选技能失败')
   return res.text()
 }
 
@@ -87,39 +97,35 @@ export interface MergedPatch {
 }
 
 export async function fetchStepRecord(runId: string, step: number | string): Promise<StepRecord> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/record`)
+  const res = await apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/record`)
   if (!res.ok) return {}
   return res.json()
 }
 
 export async function fetchRolloutResults(runId: string, step: number | string): Promise<RolloutResult[]> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/rollout-results`)
+  const res = await apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/rollout-results`)
   if (!res.ok) return []
   return res.json()
 }
 
 export async function fetchSelectionResults(runId: string, step: number | string): Promise<RolloutResult[]> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/selection-results`)
+  const res = await apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/selection-results`)
   if (!res.ok) return []
   return res.json()
 }
 
 export async function fetchStepPatches(runId: string, step: number | string): Promise<MergedPatch> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/patches`)
+  const res = await apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/steps/${encodeURIComponent(step)}/patches`)
   if (!res.ok) return {}
   return res.json()
 }
 
-export async function fetchTrainingConfig(runId: string): Promise<TrainingConfig | null> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/config`)
-  if (!res.ok) throw new Error('Failed to fetch')
-  return res.json()
+export function fetchTrainingConfig(runId: string, signal?: AbortSignal): Promise<TrainingConfig | null> {
+  return readJson(`/runs/${encodeURIComponent(runId)}/config`, signal)
 }
 
-export async function fetchTrainingData(runId: string): Promise<TrainingData> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/data`)
-  if (!res.ok) throw new Error('Failed to fetch')
-  return res.json()
+export function fetchTrainingData(runId: string, signal?: AbortSignal): Promise<TrainingData> {
+  return readJson(`/runs/${encodeURIComponent(runId)}/data`, signal)
 }
 
 export interface StartTrainingResponse {
@@ -154,7 +160,7 @@ export async function startTraining(config: NewTrainingConfig): Promise<StartTra
     if (config.uploadedFiles?.test) formData.append('testFile', config.uploadedFiles.test)
     if (config.uploadedFiles?.initialSkill) formData.append('skillFile', config.uploadedFiles.initialSkill)
 
-    const res = await fetch(`${API_BASE}/train`, {
+    const res = await apiFetch(`${API_BASE}/train`, {
       method: 'POST',
       headers: getAuthHeaders(false),
       body: formData,
@@ -166,7 +172,7 @@ export async function startTraining(config: NewTrainingConfig): Promise<StartTra
     return res.json()
   } else {
     // Manual mode: send JSON
-    const res = await fetch(`${API_BASE}/train`, {
+    const res = await apiFetch(`${API_BASE}/train`, {
       method: 'POST',
       headers: getAuthHeaders(),
       body: JSON.stringify({
@@ -201,7 +207,7 @@ export async function startTraining(config: NewTrainingConfig): Promise<StartTra
 }
 
 export async function stopTraining(runId: string): Promise<{ status: string; message: string }> {
-  const res = await fetch(`${API_BASE}/train/${encodeURIComponent(runId)}/stop`, {
+  const res = await apiFetch(`${API_BASE}/train/${encodeURIComponent(runId)}/stop`, {
     method: 'POST',
     headers: getAuthHeaders(),
   })
@@ -210,7 +216,7 @@ export async function stopTraining(runId: string): Promise<{ status: string; mes
 }
 
 export async function restartTraining(runId: string): Promise<{ status: string; runId: string; message: string }> {
-  const res = await fetch(`${API_BASE}/train/${encodeURIComponent(runId)}/restart`, {
+  const res = await apiFetch(`${API_BASE}/train/${encodeURIComponent(runId)}/restart`, {
     method: 'POST',
     headers: getAuthHeaders(),
   })
@@ -222,7 +228,7 @@ export async function restartTraining(runId: string): Promise<{ status: string; 
 }
 
 export async function deleteTraining(runId: string): Promise<{ status: string; message: string }> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}`, {
+  const res = await apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}`, {
     method: 'DELETE',
     headers: getAuthHeaders(),
   })
@@ -253,13 +259,13 @@ export interface SaveApiKeysPayload {
 }
 
 export async function fetchApiKeys(): Promise<ApiKeySettings> {
-  const res = await fetch(`${API_BASE}/settings/api-keys`, { headers: getAuthHeaders() })
+  const res = await apiFetch(`${API_BASE}/settings/api-keys`, { headers: getAuthHeaders() })
   if (!res.ok) throw new Error('Failed to load settings')
   return res.json()
 }
 
 export async function saveApiKeys(payload: SaveApiKeysPayload): Promise<{ status: string; keys: ApiKeySettings }> {
-  const res = await fetch(`${API_BASE}/settings/api-keys`, {
+  const res = await apiFetch(`${API_BASE}/settings/api-keys`, {
     method: 'PUT',
     headers: getAuthHeaders(),
     body: JSON.stringify(payload),
@@ -276,7 +282,7 @@ export interface TestApiKeyResult {
 }
 
 export async function testApiKey(provider: string): Promise<TestApiKeyResult> {
-  const res = await fetch(`${API_BASE}/settings/api-keys/test`, {
+  const res = await apiFetch(`${API_BASE}/settings/api-keys/test`, {
     method: 'POST',
     headers: getAuthHeaders(),
     body: JSON.stringify({ provider }),
@@ -286,7 +292,7 @@ export async function testApiKey(provider: string): Promise<TestApiKeyResult> {
 }
 
 export async function deleteApiKey(provider: string): Promise<{ status: string; keys: ApiKeySettings }> {
-  const res = await fetch(`${API_BASE}/settings/api-keys/${encodeURIComponent(provider)}`, {
+  const res = await apiFetch(`${API_BASE}/settings/api-keys/${encodeURIComponent(provider)}`, {
     method: 'DELETE',
     headers: getAuthHeaders(),
   })
@@ -309,7 +315,7 @@ export interface SaveSkillResponse {
 }
 
 export async function saveSkill(payload: SaveSkillPayload): Promise<SaveSkillResponse> {
-  const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(payload.skillId)}`, {
+  const res = await apiFetch(`${API_BASE}/skills/${encodeURIComponent(payload.skillId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -342,7 +348,7 @@ export interface TestSkillResult {
 }
 
 export async function testSkill(payload: TestSkillPayload): Promise<TestSkillResult> {
-  const res = await fetch(`${API_BASE}/skills/test`, {
+  const res = await apiFetch(`${API_BASE}/skills/test`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -365,7 +371,7 @@ export function chat(
 
   ;(async () => {
     try {
-      const res = await fetch(`${API_BASE}/chat`, {
+      const res = await apiFetch(`${API_BASE}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -439,29 +445,32 @@ export function chat(
 }
 
 // ─── Templates API ───
-export interface SkillTemplate {
-  id: string; name: string; description: string; icon: string; category: string
-  difficulty: string; skillContent: string; trainQa: any[]; valQa: any[]
-  splitRatio: number; config: any; expectedMetrics: any; highlights: string[]
-}
+export type { SkillTemplate } from '../data/templates'
 
-export async function fetchTemplates(): Promise<SkillTemplate[]> {
-  const res = await fetch(`${API_BASE}/templates`, { headers: getAuthHeaders() })
-  if (!res.ok) throw new Error('Failed to fetch templates')
-  return res.json()
+type StoredTemplate = Omit<SkillTemplate, 'categoryLabel' | 'env'> & Partial<Pick<SkillTemplate, 'categoryLabel' | 'env'>>
+
+export async function fetchTemplates(signal?: AbortSignal): Promise<SkillTemplate[]> {
+  const templates = await readJson<StoredTemplate[]>('/templates', signal)
+  return templates.map(template => ({
+    ...template,
+    categoryLabel: template.categoryLabel || CATEGORIES.find(category => category.key === template.category)?.label || '自定义',
+    env: template.env || template.config?.env || 'searchqa',
+    config: { ...DEFAULT_CONFIG, ...template.config },
+    expectedMetrics: { ...DEFAULT_METRICS, ...template.expectedMetrics },
+  }))
 }
 
 export async function saveTemplate(tpl: SkillTemplate): Promise<void> {
-  const res = await fetch(`${API_BASE}/templates`, {
+  const res = await apiFetch(`${API_BASE}/templates`, {
     method: 'POST',
     headers: getAuthHeaders(),
-    body: JSON.stringify(tpl),
+    body: JSON.stringify({ ...tpl, config: { ...tpl.config, env: tpl.env } }),
   })
   if (!res.ok) throw new Error('Failed to save template')
 }
 
 export async function deleteTemplate(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/templates/${encodeURIComponent(id)}`, {
+  const res = await apiFetch(`${API_BASE}/templates/${encodeURIComponent(id)}`, {
     method: 'DELETE',
     headers: getAuthHeaders(),
   })
@@ -476,26 +485,58 @@ export interface LogEntry {
   created_at: string
 }
 
-export async function fetchTrainingLogs(runId: string, limit = 500): Promise<LogEntry[]> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/logs?limit=${limit}`)
-  if (!res.ok) throw new Error('Failed to fetch logs')
-  return res.json()
+export function fetchTrainingLogs(runId: string, limit = 500, signal?: AbortSignal): Promise<LogEntry[]> {
+  return readJson(`/runs/${encodeURIComponent(runId)}/logs?limit=${limit}`, signal)
 }
 
 // ─── AI Summary (streaming) ───
-export async function generateAISummaryStream(runId: string): Promise<Response> {
-  return fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/generate-summary?stream=1`, {
+export async function generateAISummaryStream(runId: string, signal?: AbortSignal): Promise<Response> {
+  return apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/generate-summary?stream=1`, {
     method: 'POST',
     headers: getAuthHeaders(),
+    signal,
   })
 }
 
-export async function askAIChat(runId: string, question: string): Promise<Response> {
-  return fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/chat`, {
+export async function askAIChat(runId: string, question: string, signal?: AbortSignal): Promise<Response> {
+  return apiFetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/chat`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: getAuthHeaders(),
     body: JSON.stringify({ question }),
+    signal,
   })
+}
+
+export async function readAIStream(response: Response, onText: (text: string) => void, signal: AbortSignal): Promise<string> {
+  await handleApiError(response, '请求失败')
+  if (!response.body) throw new Error('响应内容为空')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let text = ''
+  try {
+    while (!signal.aborted) {
+      const { done, value } = await reader.read()
+      if (signal.aborted) throw new DOMException('Request cancelled', 'AbortError')
+      buffer += done ? decoder.decode() + '\n' : decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue
+        const payload = line.slice(5).trim()
+        if (payload === '[DONE]') return text
+        const data = JSON.parse(payload) as { text?: string; done?: boolean; error?: string }
+        if (data.error) throw new Error(data.error)
+        if (data.text) { text += data.text; onText(text) }
+        if (data.done) return text
+      }
+      if (done) return text
+    }
+    throw new DOMException('Request cancelled', 'AbortError')
+  } finally {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
 }
 
 // ─── Evaluation Details ───
@@ -526,16 +567,11 @@ export interface EvalSummary {
   avg_f1: number
 }
 
-export async function fetchEvalSummary(runId: string): Promise<EvalSummary[]> {
-  const res = await fetch(`${API_BASE}/runs/${encodeURIComponent(runId)}/evaluations`)
-  if (!res.ok) throw new Error('Failed to fetch evaluations')
-  return res.json()
+export function fetchEvalSummary(runId: string, signal?: AbortSignal): Promise<EvalSummary[]> {
+  return readJson(`/runs/${encodeURIComponent(runId)}/evaluations`, signal)
 }
 
-export async function fetchEvalDetails(runId: string, step: number, phase?: string): Promise<EvalDetail[]> {
-  let url = `${API_BASE}/runs/${encodeURIComponent(runId)}/evaluations?step=${step}`
-  if (phase) url += `&phase=${phase}`
-  const res = await fetch(url)
-  if (!res.ok) throw new Error('Failed to fetch evaluation details')
-  return res.json()
+export function fetchEvalDetails(runId: string, step: number, phase?: string, signal?: AbortSignal): Promise<EvalDetail[]> {
+  const phaseQuery = phase ? `&phase=${encodeURIComponent(phase)}` : ''
+  return readJson(`/runs/${encodeURIComponent(runId)}/evaluations?step=${step}${phaseQuery}`, signal)
 }
