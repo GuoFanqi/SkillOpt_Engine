@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test": "node --import ./server/node_modules/tsx/dist/loader.mjs --test tests/*.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {

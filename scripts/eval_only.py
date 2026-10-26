@@ -38,6 +38,7 @@ from skillopt.model.common import default_model_for_backend, normalize_backend_n
 
 _OPENAI_DEFAULT_MODEL_SENTINELS = {"gpt-5.4", "gpt-5.5"}
 from skillopt.utils import compute_score
+from skillopt.utils.scoring import evaluation_coverage
 
 
 # ── Reuse registry from train.py ───────────────────────────────────────────
@@ -130,8 +131,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=str, required=True)
     p.add_argument("--skill", type=str, required=True,
                    help="Path to skill .md file to evaluate")
-    p.add_argument("--split", type=str, default="all",
-                   help="Which split to eval: train/valid_seen/valid_unseen/all (default: all)")
+    p.add_argument("--split", type=str, default="valid_unseen",
+                   choices=["train", "val", "test", "valid_seen", "valid_unseen", "all"],
+                   help="Which split to eval (default: valid_unseen/test); all reports each split separately")
     p.add_argument("--cfg-options", nargs="+", default=[],
                    help="Override config: section.key=value")
     # Legacy flat overrides
@@ -196,6 +198,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", type=str,
                    help="SpreadsheetBench: single/multi/react (default comes from config)")
     return p.parse_args()
+
+
+def evaluate_splits(adapter, skill_content: str, out_root: str, split: str, seed: int, env_num: int = 0) -> dict:
+    names = ("train", "valid_seen", "valid_unseen") if split == "all" else (split,)
+    scores = {}
+    for name in names:
+        env = adapter.build_eval_env(0 if split == "all" else env_num, name, seed)
+        output = os.path.join(out_root, name) if split == "all" else out_root
+        results = adapter.rollout(env, skill_content, output)
+        hard, soft = compute_score(results)
+        scores[name] = {"n_items": len(results), "hard": hard, "soft": soft, **evaluation_coverage(results)}
+        print(f"  [eval {name}] hard={hard:.4f} soft={soft:.4f} (n={len(results)})")
+    return {"split": split, "splits": scores, "n_items": sum(row["n_items"] for row in scores.values())}
 
 
 def main() -> None:
@@ -408,39 +423,12 @@ def main() -> None:
     adapter.setup(cfg)
 
     seed = cfg.get("seed", 42)
-    split = args.split or "all"
-
-    if split == "all":
-        items = (
-            adapter.build_eval_env(0, "train", seed)
-            + adapter.build_eval_env(0, "valid_seen", seed)
-            + adapter.build_eval_env(0, "valid_unseen", seed)
-        )
-    else:
-        env_num = cfg.get("test_env_num", 0)
-        items = adapter.build_eval_env(env_num, split, seed)
-
-    print(f"\n  [eval] split={split}  items={len(items)}")
-    print(f"  [eval] out_root={out_root}")
-    print(f"{'='*60}")
-
-    # Run rollout
-    results = adapter.rollout(items, skill_content, out_root)
-
-    # Score
-    hard, soft = compute_score(results)
-    print(f"\n{'='*60}")
-    print(f"  Results: hard={hard:.4f}  soft={soft:.4f}  (n={len(results)})")
-    print(f"{'='*60}")
-
-    # Save summary
-    summary = {
-        "skill": skill_path,
-        "split": split,
-        "n_items": len(results),
-        "hard": hard,
-        "soft": soft,
-    }
+    split = args.split or "valid_unseen"
+    print(f"\n  [eval] split={split} out_root={out_root}")
+    summary = evaluate_splits(adapter, skill_content, out_root, split, seed, cfg.get("test_env_num", 0))
+    summary["skill"] = skill_path
+    if split != "all":
+        summary.update(summary["splits"][split])
     with open(os.path.join(out_root, "eval_summary.json"), "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 

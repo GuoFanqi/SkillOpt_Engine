@@ -9,6 +9,7 @@ import { useWebSocket } from '../hooks/useWebSocket'
 import { useToast } from '../components/Toast'
 import { useConfirm } from '../components/ConfirmDialog'
 import { DashboardSkeleton } from '../components/Loading'
+import { applyRunState, mergeTrainingRuns, needsRunRefresh, runStateLabel } from '../lib/runState'
 
 // Memoize run names to prevent NewTrainingModal useEffect from resetting template selection
 function useRunNames(runs: TrainingRun[]) {
@@ -36,8 +37,13 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [showNewTrainingModal, setShowNewTrainingModal] = useState(false)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
-  const [refreshing, setRefreshing] = useState(false)
-  const { messages } = useWebSocket()
+  const { states, connectionVersion } = useWebSocket()
+  const statesRef = useRef(states)
+  statesRef.current = states
+  const requestRef = useRef<AbortController | null>(null)
+  const pendingRef = useRef<Promise<void> | null>(null)
+  const refreshQueued = useRef(false)
+  const seenStates = useRef<Record<string, string>>({})
   const { showToast } = useToast()
   const { confirm } = useConfirm()
   const existingNames = useRunNames(runs)
@@ -84,62 +90,73 @@ export default function Dashboard() {
     }
   })
 
-  const loadData = useCallback(async () => {
-    try {
-      const runsData = await fetchTrainingRuns()
-      setRuns(runsData)
-    } catch (error) {
-      console.error('Failed to load data:', error)
-      setRuns([])
+  const loadData = useCallback((): Promise<void> => {
+    if (pendingRef.current) {
+      refreshQueued.current = true
+      return pendingRef.current
     }
-  }, [token])
+    const controller = new AbortController()
+    requestRef.current = controller
+    const pending = fetchTrainingRuns(controller.signal)
+      .then(data => {
+        if (!controller.signal.aborted) setRuns(previous => mergeTrainingRuns(previous, data, statesRef.current))
+      })
+      .catch(error => {
+        if (!controller.signal.aborted) showToast('error', error instanceof Error ? error.message : '读取训练列表失败')
+      })
+      .finally(() => {
+        if (requestRef.current !== controller) return
+        requestRef.current = null
+        pendingRef.current = null
+        if (refreshQueued.current && !controller.signal.aborted) {
+          refreshQueued.current = false
+          void loadData()
+        }
+      })
+    pendingRef.current = pending
+    return pending
+  }, [token, showToast])
 
   useEffect(() => {
+    let disposed = false
+    setRuns([])
     setLoading(true)
-    loadData().finally(() => setLoading(false))
+    loadData().finally(() => { if (!disposed) setLoading(false) })
+    return () => {
+      disposed = true
+      requestRef.current?.abort()
+      requestRef.current = null
+      pendingRef.current = null
+      refreshQueued.current = false
+    }
   }, [loadData])
 
-  // Real-time progress from WebSocket
   useEffect(() => {
-    const lastMsg = messages[messages.length - 1]
-    if (!lastMsg) return
-    if (lastMsg.type === 'complete') {
-      loadData() // Refresh immediately on completion
+    setRuns(previous => previous.map(run => applyRunState(run, states[run.id])))
+    let refresh = false
+    for (const [runId, state] of Object.entries(states)) {
+      const key = `${state.attempt}:${state.completedSteps}:${state.status}:${state.artifactSync}`
+      if (seenStates.current[runId] !== key) {
+        seenStates.current[runId] = key
+        refresh = true
+      }
     }
-    if (lastMsg.type === 'progress' && lastMsg.data && typeof lastMsg.data === 'object') {
-      const { step, currentScore, bestScore } = lastMsg.data as { step: number; currentScore: number; bestScore: number }
-      setRuns(prev => prev.map(r => {
-        if (r.id === lastMsg.runId) {
-          return {
-            ...r,
-            totalSteps: step,
-            currentScore: currentScore,
-            bestScore: bestScore,
-            status: 'training',
-          }
-        }
-        return r
-      }))
-    }
-  }, [messages])
+    if (refresh) void loadData()
+  }, [states, loadData])
 
-  // Auto-refresh when training
   useEffect(() => {
-    const hasTraining = runs.some((r) => r.status === 'training')
-    if (hasTraining) {
-      if (!pollRef.current) pollRef.current = setInterval(loadData, 5000)
-    } else {
-      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
-    }
-    return () => { if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null } }
-  }, [runs.map(r => r.status).join(','), loadData])
+    if (connectionVersion > 0) void loadData()
+  }, [connectionVersion, loadData])
 
-  // WebSocket refresh
+  const needsRefresh = runs.some(needsRunRefresh)
   useEffect(() => {
-    const lastMsg = messages[messages.length - 1]
-    if (lastMsg?.type === 'complete') setTimeout(() => loadData(), 1000)
-    if (lastMsg?.type === 'log' || lastMsg?.type === 'error') loadData()
-  }, [messages, loadData])
+    if (!needsRefresh) return
+    pollRef.current = setInterval(loadData, 3000)
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current)
+      pollRef.current = null
+    }
+  }, [needsRefresh, loadData])
 
   // ── Computed stats ────────────────────────────────────────
   // 过滤掉空壳任务（从未真正训练过）
@@ -299,8 +316,9 @@ export default function Dashboard() {
     loadData()
   }
 
-  const getStatusBadge = (status: TrainingRun['status']) => {
-    switch (status) {
+  const getStatusBadge = (run: TrainingRun) => {
+    if (run.state) return <span className={`badge ${run.status === 'completed' ? 'bg-green-50 text-green-700' : run.status === 'failed' ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>{runStateLabel(run.state)}</span>
+    switch (run.status) {
       case 'completed': return <span className="badge bg-green-50 text-green-600 border border-green-100">已完成</span>
       case 'training': return <span className="badge bg-blue-50 text-blue-600 border border-blue-100">训练中</span>
       case 'failed': return <span className="badge bg-red-50 text-red-600 border border-red-100">失败</span>
@@ -470,7 +488,7 @@ export default function Dashboard() {
                     <span className="text-sm font-semibold text-gray-800 truncate">
                       {run.name.replace(/loopskill_\w+_/, '').replace(/_\d{8}_\d{6}$/, '')}
                     </span>
-                    {getStatusBadge(run.status)}
+                    {getStatusBadge(run)}
                   </div>
 
                   {/* ── 核心：优化效果对比 ── */}
@@ -618,12 +636,12 @@ export default function Dashboard() {
                   {run.status === 'training' && run.totalSteps > 0 && (
                     <div className="mt-2">
                       <div className="flex justify-between text-[10px] text-gray-500 mb-1">
-                        <span>训练中 · 第 {run.totalSteps} 步</span>
-                        <span>{run.currentScore}%</span>
+                        <span>已完成 {run.totalSteps}{run.state?.totalSteps ? `/${run.state.totalSteps}` : ''} 个优化步骤</span>
+                        <span>{run.state?.currentScore === null ? '待评测' : `${run.currentScore}%`}</span>
                       </div>
-                      <div className="w-full bg-gray-100 rounded-full h-1 overflow-hidden">
-                        <div className="h-full bg-blue-400 rounded-full animate-pulse" style={{ width: '40%' }} />
-                      </div>
+                      {run.state && run.state.totalSteps > 0 && <div className="w-full bg-gray-100 rounded-full h-1 overflow-hidden">
+                        <div className="h-full bg-blue-400 rounded-full" style={{ width: `${Math.min(100, run.totalSteps / run.state.totalSteps * 100)}%` }} />
+                      </div>}
                     </div>
                   )}
 
@@ -692,7 +710,7 @@ export default function Dashboard() {
                 <div className="flex items-center gap-3 mb-3">
                   <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${getStatusColor(run.status)}`}></div>
                   <span className="font-semibold text-gray-900 truncate text-sm">{run.name}</span>
-                  {getStatusBadge(run.status)}
+                  {getStatusBadge(run)}
                 </div>
                 <div className="flex items-center gap-5 text-sm text-gray-400 flex-wrap">
                   {/* 分数对比：初始 → 优化后 */}
@@ -753,10 +771,9 @@ export default function Dashboard() {
                   )}
                 </div>
                 {run.status === 'training' && (() => {
-                  const steps = run.totalSteps || 0
-                  // @ts-ignore - config may not be in type but exists at runtime
-                  const total = (run as any).config?.total_steps || (run.epochs || 2) * 2
-                  const pct = total > 0 ? Math.min(95, (steps / total) * 100) : 5
+                  const steps = run.totalSteps
+                  const total = run.state?.totalSteps ?? 0
+                  const pct = total > 0 ? Math.min(100, (steps / total) * 100) : 0
                   return (
                   <div className="mt-4 bg-gradient-to-r from-blue-50/80 to-indigo-50/60 rounded-xl p-3.5 border border-blue-100/60">
                     <div className="flex items-center justify-between mb-2">
@@ -765,14 +782,14 @@ export default function Dashboard() {
                           <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-500 opacity-75" />
                           <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-600" />
                         </div>
-                        <span className="text-xs font-medium text-blue-700">{steps > 0 ? '正在训练' : '准备中'}</span>
+                        <span className="text-xs font-medium text-blue-700">{run.state ? runStateLabel(run.state) : '等待真实阶段同步'}</span>
                       </div>
                       <span className={`text-xs font-semibold tabular-nums ${steps > 0 ? 'text-blue-700' : 'text-gray-400'}`}>
-                        {steps > 0 ? `${Math.round(pct)}% · ${steps}/${total} 步` : '初始化中...'}
+                        {total > 0 ? `优化步骤 ${steps}/${total} · ${Math.round(pct)}%` : `已完成 ${steps} 步 · 总步数待同步`}
                       </span>
                     </div>
                     <div className="w-full bg-white/70 rounded-lg h-2.5 overflow-hidden shadow-inner ring-1 ring-black/4">
-                      {steps > 0 ? (
+                      {total > 0 ? (
                         <div
                           className="h-2.5 rounded-lg transition-all duration-700 ease-out relative"
                           style={{ width: `${pct}%`, background: `linear-gradient(90deg, #3B82F6, #6366F1)` }}

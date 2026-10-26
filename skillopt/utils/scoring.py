@@ -4,13 +4,54 @@ from __future__ import annotations
 import hashlib
 
 
-def compute_score(results: list) -> tuple[float, float]:
-    """Compute hard and soft accuracy from a list of episode results.
+def _result_field(result: object, name: str, default=None):
+    if isinstance(result, dict):
+        return result.get(name, default)
+    if hasattr(result, name):
+        return getattr(result, name)
+    return getattr(result, "extras", {}).get(name, default)
 
-    Accepts both plain dicts and :class:    instances.  hard may be continuous (0.0-1.0) when using smoothed reward.
-    """
-    if not results:
-        return 0.0, 0.0
+
+def is_execution_error(result: object) -> bool:
+    explicit = _result_field(result, "execution_error")
+    if explicit is not None:
+        return bool(explicit)
+    return (
+        _result_field(result, "agent_ok") is False
+        or _result_field(result, "llm_ok") is False
+        or _result_field(result, "phase") in {"timeout", "error"}
+    )
+
+
+def evaluation_coverage(results: list) -> dict[str, int | float]:
+    total = len(results)
+    failed = sum(is_execution_error(result) for result in results)
+    return {
+        "total": total,
+        "valid": total - failed,
+        "execution_errors": failed,
+        "coverage": (total - failed) / total if total else 0.0,
+    }
+
+
+class IncompleteEvaluationError(RuntimeError):
+    def __init__(self, results: list):
+        self.coverage = evaluation_coverage(results)
+        super().__init__(
+            "Evaluation incomplete: "
+            f"{self.coverage['valid']}/{self.coverage['total']} valid results, "
+            f"{self.coverage['execution_errors']} execution errors; no score was produced."
+        )
+
+
+def ensure_complete_evaluation(results: list) -> None:
+    if not results or any(is_execution_error(result) for result in results):
+        raise IncompleteEvaluationError(results)
+
+
+def compute_score(results: list) -> tuple[float, float]:
+    """Score a complete evaluation without dropping failed executions."""
+    ensure_complete_evaluation(results)
 
     def _hard(r: object) -> float:
         return float(r.hard if hasattr(r, "hard") else r.get("hard", 0))

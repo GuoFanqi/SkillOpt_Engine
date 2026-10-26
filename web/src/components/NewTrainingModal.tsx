@@ -1,5 +1,5 @@
 import { useState, useRef, DragEvent, useEffect } from 'react'
-import { X, Upload, Plus, Trash2, FileText, Check, AlertCircle, BookTemplate, ChevronDown, Zap, TrendingUp, BarChart3, Settings2 } from 'lucide-react'
+import { X, Upload, Plus, Trash2, FileText, Check, AlertCircle, BookTemplate, Zap, Settings2 } from 'lucide-react'
 import { fetchApiKeys, ApiKeySettings } from '../services/api'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from '../components/Toast'
@@ -168,24 +168,6 @@ export default function NewTrainingModal({ isOpen, onClose, onSubmit, existingNa
 
   const clearTemplateSelection = () => {
     setSelectedTemplateIds([])
-  }
-
-  const handleSelectSingleTemplate = (tplId: string) => {
-    setSelectedTemplateIds([tplId])
-    setErrors({})
-    if (!tplId) return
-
-    const tpl = TEMPLATES.find(t => t.id === tplId)
-    if (!tpl) return
-
-    const prefill = applyTemplate(tpl)
-    setTrainingName(prefill.name)
-    setConfig(prev => ({ ...prev, ...prefill.config, model: prev.model || 'deepseek-flash' }))
-    setDataMode('manual')
-    setSkillContent(prefill.skillContent)
-    setQaPairs(prefill.qaPairs)
-    setTrainSplit(70)
-    setValSplit(30)
   }
 
   // Load API keys status & generate default training name when modal opens

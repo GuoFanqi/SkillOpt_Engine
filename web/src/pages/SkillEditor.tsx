@@ -123,7 +123,7 @@ export default function SkillEditor() {
               <option value="best">最佳版本</option>
               {versions.map((v) => (
                 <option key={v.version} value={v.version}>
-                  {v.name} ({v.chars} chars)
+                  {v.path.split('/').pop() || v.version} ({v.chars} chars)
                 </option>
               ))}
             </select>

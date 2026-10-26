@@ -3,16 +3,28 @@ from __future__ import annotations
 import re
 import string
 from collections import Counter
+from decimal import Decimal
 
 
 _NUMERIC_CHARS = set("0123456789.-")
+_SCALES = {"thousand": 1000, "million": 1000000, "billion": 1000000000, "trillion": 1000000000000}
+
+
+def _scaled_number(match: re.Match) -> str:
+    value = Decimal(match[1]) * _SCALES[match[2].rstrip("s")]
+    return format(value.normalize(), "f")
 
 
 def normalize_answer(text: str) -> str:
-    text = text.lower().strip()
-    text = text.replace(",", "")
+    text = text.lower().strip().replace(",", "")
+    text = re.sub(
+        r"(?<![\w.])([-+]?\d+(?:\.\d+)?)\s*(thousands?|millions?|billions?|trillions?)\b",
+        _scaled_number,
+        text,
+    )
     text = "".join(ch for ch in text if ch not in string.punctuation or ch in _NUMERIC_CHARS or ch == "%")
-    text = re.sub(r"\b(million|millions|billion|billions|dollars|dollar|nominal)\b", " ", text)
+    text = re.sub(r"(?<![\w.])[-+]?\d+(?:\.\d+)?(?![\w.])", lambda match: format(Decimal(match[0]).normalize(), "f"), text)
+    text = re.sub(r"\b(dollars|dollar|nominal)\b", " ", text)
     text = " ".join(text.split())
     return text
 

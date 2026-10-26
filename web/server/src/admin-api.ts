@@ -1,168 +1,154 @@
-// Admin CRUD API handlers
 import { Router } from 'express'
-import jwt from 'jsonwebtoken'
+import type { PoolConnection } from 'mysql2/promise'
+import { requireAuth } from './auth.js'
+import { getConnection } from './db.js'
 
-const JWT_SECRET = process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? '' : 'dev-secret')
-const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || ''
-
-const authMiddleware = (req: any, res: any, next: any) => {
-  const header = req.headers.authorization
-  if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: '未登录' })
-  try { req.user = jwt.verify(header.slice(7), JWT_SECRET); next() }
-  catch { res.status(401).json({ error: '登录已过期' }) }
+interface AdminOptions {
+  withRunsLocked: (ids: string[], operation: () => Promise<void>) => Promise<void>
 }
 
 const adminOnly = (req: any, res: any, next: any) => {
-  if (!req.user?.is_admin) return res.status(403).json({ error: '需要管理员权限' })
+  if (req.user?.is_admin !== 1) return res.status(403).json({ error: '需要管理员权限' })
   next()
 }
 
-async function getConn() {
-  const { default: mysql2 } = await import('mysql2/promise')
-  return mysql2.createConnection({ host:'127.0.0.1', port:3306, user:'root', password: MYSQL_PASSWORD, database:'skillopt' })
+async function withConnection<T>(work: (connection: PoolConnection) => Promise<T>): Promise<T> {
+  const connection = await (await getConnection()).getConnection()
+  try { return await work(connection) } finally { connection.release() }
 }
 
-export function registerAdminRoutes(app: any) {
+export function registerAdminRoutes(app: any, options: AdminOptions) {
   const router = Router()
-  router.use(authMiddleware)
+  router.use(requireAuth)
   router.use(adminOnly)
-
-  // Allowed tables for direct CRUD
   const tables = ['training_runs', 'templates', 'step_history', 'skill_versions', 'training_data_items', 'training_logs', 'evaluation_details', 'user_skills', 'users']
+  const runTables = new Set(['training_runs', 'step_history', 'skill_versions', 'training_data_items', 'training_logs', 'evaluation_details'])
+  const fail = (res: any, error: any) => res.status(error.status || 500).json({ error: error.status ? error.message : '数据库操作失败' })
 
-  // List table data
   router.get('/table/:table', async (req: any, res) => {
     const table = req.params.table
     if (!tables.includes(table)) return res.status(400).json({ error: 'Invalid table' })
-    const limit = Math.min(parseInt(req.query.limit as string) || 500, 500)
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit as string) || 500, 500))
     try {
-      const p = await getConn()
-      const col = table === 'training_logs' || table === 'evaluation_details' ? 'id' : 'id'
-      const [rows] = await p.execute(`SELECT * FROM \`${table}\` ORDER BY \`${col}\` DESC LIMIT ${limit}`)
-      await p.end()
+      const rows = await withConnection(async connection => {
+        const [rows] = await connection.execute(`SELECT * FROM \`${table}\` ORDER BY id DESC LIMIT ${limit}`)
+        return rows
+      })
       res.json(rows)
-    } catch (e: any) { res.status(500).json({ error: e.message }) }
+    } catch (error) { fail(res, error) }
   })
 
-  // Get single row
   router.get('/table/:table/:id', async (req: any, res) => {
     const table = req.params.table
     if (!tables.includes(table)) return res.status(400).json({ error: 'Invalid table' })
     try {
-      const p = await getConn()
-      const [rows] = await p.execute(`SELECT * FROM \`${table}\` WHERE id = ?`, [req.params.id]) as any[]
-      await p.end()
-      if (rows.length === 0) return res.status(404).json({ error: 'Not found' })
-      res.json(rows[0])
-    } catch (e: any) { res.status(500).json({ error: e.message }) }
+      const row = await withConnection(async connection => {
+        const [rows] = await connection.execute(`SELECT * FROM \`${table}\` WHERE id = ?`, [req.params.id]) as any[]
+        return rows[0]
+      })
+      if (!row) return res.status(404).json({ error: 'Not found' })
+      res.json(row)
+    } catch (error) { fail(res, error) }
   })
 
-  // Delete row (with cascade for users)
   router.delete('/table/:table/:id', async (req: any, res) => {
     const table = req.params.table
     if (!tables.includes(table)) return res.status(400).json({ error: 'Invalid table' })
+    if (table === 'training_runs') return res.status(409).json({ error: '请通过训练管理删除任务，避免丢失产物与状态' })
     try {
-      const p = await getConn()
-      // Cascade: deleting a user removes all their data
-      if (table === 'users') {
-        const userId = parseInt(req.params.id)
-        // Find all training runs owned by this user
-        const [runs] = await p.execute('SELECT id FROM training_runs WHERE user_id = ?', [userId]) as any[]
-        for (const run of runs) {
-          await p.execute('DELETE FROM step_history WHERE run_id = ?', [run.id])
-          await p.execute('DELETE FROM skill_versions WHERE run_id = ?', [run.id])
-          await p.execute('DELETE FROM training_data_items WHERE run_id = ?', [run.id])
-          await p.execute('DELETE FROM training_logs WHERE run_id = ?', [run.id])
-          await p.execute('DELETE FROM evaluation_details WHERE run_id = ?', [run.id])
+      await withConnection(async connection => {
+        const [rows] = await connection.execute(`SELECT * FROM \`${table}\` WHERE id = ?`, [req.params.id]) as any[]
+        if (!rows[0]) throw Object.assign(new Error('Not found'), { status: 404 })
+        if (table === 'users') {
+          const [runs] = await connection.execute('SELECT id FROM training_runs WHERE user_id = ?', [req.params.id]) as any[]
+          if (runs.length) throw Object.assign(new Error('用户仍有训练任务，请先通过训练管理逐个处理，不能级联删除'), { status: 409 })
+          await connection.beginTransaction()
+          try {
+            await connection.execute('DELETE FROM templates WHERE user_id = ?', [req.params.id])
+            await connection.execute('DELETE FROM api_keys WHERE user_id = ?', [req.params.id])
+            await connection.execute('DELETE FROM users WHERE id = ?', [req.params.id])
+            await connection.commit()
+          } catch (error) { await connection.rollback(); throw error }
+          return
         }
-        await p.execute('DELETE FROM training_runs WHERE user_id = ?', [userId])
-        await p.execute('DELETE FROM templates WHERE user_id = ?', [userId])
-        await p.execute('DELETE FROM api_keys WHERE workspace_id = ?', [`user_${userId}`])
-        await p.execute('DELETE FROM user_skills WHERE user_id = ?', [userId])
-        await p.execute('DELETE FROM users WHERE id = ?', [userId])
-      } else {
-        await p.execute(`DELETE FROM \`${table}\` WHERE id = ?`, [req.params.id])
-      }
-      await p.end()
+        const ids = runTables.has(table) ? [table === 'training_runs' ? String(rows[0].id) : String(rows[0].run_id)] : []
+        await options.withRunsLocked(ids, async () => {
+          await connection.execute(`DELETE FROM \`${table}\` WHERE id = ?`, [req.params.id])
+        })
+      })
       res.json({ success: true })
-    } catch (e: any) { res.status(500).json({ error: e.message }) }
+    } catch (error) { fail(res, error) }
   })
 
-  // Update row
   router.put('/table/:table/:id', async (req: any, res) => {
     const table = req.params.table
     if (!tables.includes(table)) return res.status(400).json({ error: 'Invalid table' })
+    if (runTables.has(table)) return res.status(409).json({ error: '训练状态与产物只允许通过训练接口更新' })
     const data = req.body
-    if (!data || Object.keys(data).length === 0) return res.status(400).json({ error: 'No data' })
-    // Remove protected fields
-    delete data.id
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return res.status(400).json({ error: 'No data' })
+    const keys = Object.keys(data).filter(key => key !== 'id')
+    if (!keys.length || keys.some(key => !/^[a-z][a-z0-9_]*$/.test(key))) return res.status(400).json({ error: 'Invalid fields' })
     try {
-      const p = await getConn()
-      const keys = Object.keys(data)
-      const sets = keys.map(k => `\`${k}\` = ?`).join(', ')
-      const values = Object.values(data)
-      await p.execute(`UPDATE \`${table}\` SET ${sets} WHERE id = ?`, [...values, req.params.id])
-      await p.end()
+      await withConnection(async connection => {
+        const [columns] = await connection.execute(`SHOW COLUMNS FROM \`${table}\``) as any[]
+        if (keys.some(key => !columns.some((column: any) => column.Field === key))) throw Object.assign(new Error('Invalid fields'), { status: 400 })
+        await connection.execute(`UPDATE \`${table}\` SET ${keys.map(key => `\`${key}\` = ?`).join(', ')} WHERE id = ?`, [...keys.map(key => data[key]), req.params.id])
+      })
       res.json({ success: true })
-    } catch (e: any) { res.status(500).json({ error: e.message }) }
+    } catch (error) { fail(res, error) }
   })
 
-  // Reset password
   router.post('/reset-password', async (req: any, res) => {
     const { user_id, password } = req.body
-    if (!user_id || !password) return res.status(400).json({ error: 'user_id and password required' })
+    if (!user_id || typeof password !== 'string' || password.length < 6) return res.status(400).json({ error: '密码至少6位，并需指定用户' })
     try {
       const bcrypt = await import('bcryptjs')
       const hash = await bcrypt.hash(password, 10)
-      const p = await getConn()
-      await p.execute('UPDATE users SET password_hash = ? WHERE id = ?', [hash, user_id])
-      await p.end()
+      await withConnection(connection => connection.execute('UPDATE users SET password_hash = ? WHERE id = ?', [hash, user_id]))
       res.json({ success: true })
-    } catch (e: any) { res.status(500).json({ error: e.message }) }
+    } catch (error) { fail(res, error) }
   })
 
-  // Create user
   router.post('/users', async (req: any, res) => {
     const { phone, password, is_admin } = req.body
-    if (!phone || !password) return res.status(400).json({ error: 'phone and password required' })
+    if (!phone || typeof password !== 'string' || password.length < 6) return res.status(400).json({ error: 'phone required; password must contain at least 6 characters' })
     try {
       const bcrypt = await import('bcryptjs')
       const hash = await bcrypt.hash(password, 10)
-      const p = await getConn()
-      const [result] = await p.execute('INSERT INTO users (phone, password_hash, is_admin) VALUES (?, ?, ?)', [phone, hash, is_admin ? 1 : 0]) as any
-      await p.end()
-      res.json({ id: result.insertId, phone, is_admin: is_admin ? 1 : 0 })
-    } catch (e: any) { res.status(500).json({ error: e.message }) }
+      const id = await withConnection(async connection => {
+        const [result] = await connection.execute('INSERT INTO users (phone, password_hash, is_admin) VALUES (?, ?, ?)', [phone, hash, is_admin ? 1 : 0]) as any[]
+        return result.insertId
+      })
+      res.json({ id, phone, is_admin: is_admin ? 1 : 0 })
+    } catch (error) { fail(res, error) }
   })
 
-  // DB summary
   router.get('/db-summary', async (_req: any, res) => {
     try {
-      const p = await getConn()
-      const result: Record<string, number> = {}
-      for (const t of tables) {
-        const [rows] = await p.execute(`SELECT COUNT(*) as cnt FROM \`${t}\``) as any[]
-        result[t] = rows[0].cnt
-      }
-      await p.end()
+      const result = await withConnection(async connection => {
+        const counts: Record<string, number> = {}
+        for (const table of tables) {
+          const [rows] = await connection.execute(`SELECT COUNT(*) AS cnt FROM \`${table}\``) as any[]
+          counts[table] = rows[0].cnt
+        }
+        return counts
+      })
       res.json(result)
-    } catch (e: any) { res.status(500).json({ error: e.message }) }
+    } catch (error) { fail(res, error) }
   })
 
-  // Run raw SQL (read-only: SELECT only)
   router.post('/sql', async (req: any, res) => {
-    const { sql } = req.body
-    if (!sql || typeof sql !== 'string') return res.status(400).json({ error: 'Invalid SQL' })
-    const trimmed = sql.trim().toUpperCase()
-    if (!trimmed.startsWith('SELECT') && !trimmed.startsWith('SHOW') && !trimmed.startsWith('DESCRIBE') && !trimmed.startsWith('EXPLAIN')) {
-      return res.status(400).json({ error: '仅支持 SELECT 查询' })
+    const sql = req.body?.sql
+    if (typeof sql !== 'string' || !/^(SELECT|SHOW|DESCRIBE|EXPLAIN)\b/i.test(sql.trim()) || /\bINTO\s+(OUTFILE|DUMPFILE)\b/i.test(sql)) {
+      return res.status(400).json({ error: '仅支持只读查询' })
     }
     try {
-      const p = await getConn()
-      const [rows] = await p.execute(sql)
-      await p.end()
+      const rows = await withConnection(async connection => {
+        const [rows] = await connection.execute(sql)
+        return rows
+      })
       res.json(rows)
-    } catch (e: any) { res.status(500).json({ error: e.message }) }
+    } catch (error) { fail(res, error) }
   })
 
   app.use('/api/admin', router)

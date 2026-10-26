@@ -27,7 +27,6 @@ export default function ConfirmDialogProvider({ children }: { children: React.Re
   const [cancelText, setCancelText] = useState('取消')
   const [variant, setVariant] = useState<'danger' | 'warning' | 'info'>('danger')
   const resolveRef = useRef<((value: boolean) => void) | null>(null)
-  const cancelRef = useRef<(() => void) | null>(null)
 
   useEffect(() => {
     globalConfirm = (options: ConfirmOptions): Promise<boolean> => {

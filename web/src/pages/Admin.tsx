@@ -3,15 +3,14 @@ import { Database, Table, ArrowLeft, Shield, Trash2, Save, Plus, Edit2, X } from
 import { Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 
-const API = 'http://localhost:3002/api/admin'
+import { API_BASE } from '../lib/endpoints'
+
+const API = `${API_BASE}/admin`
 const TABLE_LIST = ['users', 'training_runs', 'templates', 'step_history', 'skill_versions', 'training_data_items', 'training_logs', 'evaluation_details', 'user_skills']
 
 export default function AdminPage() {
   const { token, isAdmin } = useAuth()
   const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }
-
-  if (!token) return <div className="p-8 text-center text-gray-400">请先登录</div>
-  if (!isAdmin) return <div className="p-8 text-center text-red-500 font-medium">无权访问管理后台</div>
 
   const [dbSummary, setDbSummary] = useState<Record<string, number>>({})
   const [selectedTable, setSelectedTable] = useState('')
@@ -25,8 +24,16 @@ export default function AdminPage() {
   const [toast, setToast] = useState('')
 
   useEffect(() => {
-    fetch(`${API}/db-summary`, { headers }).then(r => r.json()).then(setDbSummary).catch(() => {})
-  }, [])
+    if (!token || !isAdmin) return
+    const controller = new AbortController()
+    fetch(`${API}/db-summary`, { headers: { Authorization: `Bearer ${token}` }, signal: controller.signal })
+      .then(response => response.ok ? response.json() : Promise.reject(new Error('读取失败')))
+      .then(summary => { if (!controller.signal.aborted) setDbSummary(summary) }).catch(() => {})
+    return () => controller.abort()
+  }, [token, isAdmin])
+
+  if (!token) return <div className="p-8 text-center text-gray-400">请先登录</div>
+  if (!isAdmin) return <div className="p-8 text-center text-red-500 font-medium">无权访问管理后台</div>
 
   const loadTable = async (table: string) => {
     setSelectedTable(table); setLoading(true); setEditingRow(null)

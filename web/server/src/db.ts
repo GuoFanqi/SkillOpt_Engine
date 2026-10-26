@@ -1,6 +1,8 @@
 import mysql from 'mysql2/promise'
 import { join } from 'path'
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs'
+import type { RunState } from '../../shared/run-state.js'
+import type { JsonObject, RunArtifactsSnapshot } from './run-artifacts.js'
 
 // ─── MySQL connection config ───
 const DB_CONFIG = {
@@ -12,26 +14,33 @@ const DB_CONFIG = {
   charset: 'utf8mb4',
 }
 
-let pool: mysql.Pool
+let poolReady: Promise<mysql.Pool> | undefined
 
 async function getPool(): Promise<mysql.Pool> {
-  if (!pool) {
-    pool = mysql.createPool({ ...DB_CONFIG, waitForConnections: true, connectionLimit: 10 })
-    // Auto-create database
-    const initConn = await mysql.createConnection({
-      host: DB_CONFIG.host, port: DB_CONFIG.port,
-      user: DB_CONFIG.user, password: DB_CONFIG.password,
+  if (!poolReady) {
+    const pool = mysql.createPool({ ...DB_CONFIG, waitForConnections: true, connectionLimit: 10 })
+    poolReady = (async () => {
+      const initConn = await mysql.createConnection({
+        host: DB_CONFIG.host, port: DB_CONFIG.port,
+        user: DB_CONFIG.user, password: DB_CONFIG.password,
+      })
+      try {
+        await initConn.execute(`CREATE DATABASE IF NOT EXISTS \`${DB_CONFIG.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`)
+      } finally {
+        await initConn.end()
+      }
+      await createTables(pool)
+      return pool
+    })().catch(async error => {
+      await pool.end()
+      poolReady = undefined
+      throw error
     })
-    await initConn.execute(`CREATE DATABASE IF NOT EXISTS \`${DB_CONFIG.database}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`)
-    await initConn.end()
-    // Create tables
-    await createTables()
   }
-  return pool
+  return poolReady
 }
 
-async function createTables() {
-  const p = await getPool()
+async function createTables(p: mysql.Pool) {
   await p.execute(`
     CREATE TABLE IF NOT EXISTS api_keys (
       workspace_id VARCHAR(64) NOT NULL DEFAULT 'default',
@@ -75,6 +84,9 @@ async function createTables() {
       ai_summary TEXT,
       train_config_json JSON,
       runtime_state TEXT,
+      state_json JSON,
+      artifact_sync_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+      artifact_sync_error TEXT,
       user_id INT DEFAULT NULL,
       config_json JSON,
       summary_json JSON,
@@ -135,6 +147,7 @@ async function createTables() {
       question TEXT NOT NULL,
       context TEXT,
       answers_json JSON,
+      item_json JSON,
       INDEX idx_run_split (run_id, split),
       FOREIGN KEY (run_id) REFERENCES training_runs(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -213,13 +226,41 @@ async function createTables() {
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `)
+  const additions: Record<string, Record<string, string>> = {
+    training_runs: {
+      state_json: 'JSON',
+      artifact_sync_status: "VARCHAR(32) NOT NULL DEFAULT 'pending'",
+      artifact_sync_error: 'TEXT',
+    },
+    training_data_items: { item_json: 'JSON' },
+  }
+  for (const [table, fields] of Object.entries(additions)) {
+    const [rows] = await p.execute('SELECT COLUMN_NAME AS name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?', [table]) as any[]
+    const names = new Set(rows.map((row: any) => row.name))
+    for (const [name, definition] of Object.entries(fields)) {
+      if (names.has(name)) continue
+      try { await p.execute(`ALTER TABLE \`${table}\` ADD COLUMN \`${name}\` ${definition}`) }
+      catch (error) { if ((error as { code?: string }).code !== 'ER_DUP_FIELDNAME') throw error }
+    }
+  }
+  for (const [table, columns] of Object.entries({
+    training_logs: ['text'],
+    evaluation_details: ['question', 'gold_answer', 'system_prompt', 'user_prompt'],
+    training_data_items: ['question', 'context'],
+  })) {
+    const [rows] = await p.execute('SELECT COLUMN_NAME AS name, DATA_TYPE AS type FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?', [table]) as any[]
+    for (const name of columns) {
+      if (rows.find((row: any) => row.name === name)?.type !== 'text') continue
+      await p.execute(`ALTER TABLE \`${table}\` MODIFY COLUMN \`${name}\` MEDIUMTEXT${table === 'training_data_items' && name === 'question' ? ' NOT NULL' : ''}`)
+    }
+  }
 }
 
 // ─── Training Logs ───
 export const trainingLogs = {
   append: async (runId: string, type: 'stdout' | 'stderr', text: string) => {
     const p = await getPool()
-    await p.execute('INSERT INTO training_logs (run_id, type, text) VALUES (?, ?, ?)', [runId, type, text.slice(0, 2000)])
+    await p.execute('INSERT INTO training_logs (run_id, type, text) VALUES (?, ?, ?)', [runId, type, text])
   },
 
   appendBatch: async (runId: string, lines: Array<{ type: 'stdout' | 'stderr'; text: string }>) => {
@@ -227,7 +268,7 @@ export const trainingLogs = {
     const p = await getPool()
     const values = lines.map(() => '(?, ?, ?)').join(', ')
     const params: any[] = []
-    for (const l of lines) { params.push(runId, l.type, l.text.slice(0, 2000)) }
+    for (const l of lines) { params.push(runId, l.type, l.text) }
     await p.execute(`INSERT INTO training_logs (run_id, type, text) VALUES ${values}`, params)
   },
 
@@ -328,13 +369,8 @@ export const trainingRuns = {
   },
 
   getByUserId: async (userId: number | null) => {
+    if (userId === null) return []
     const p = await getPool()
-    if (userId === null) {
-      // Guest: show only public training runs (user_id IS NULL)
-      const [rows] = await p.execute('SELECT * FROM training_runs WHERE user_id IS NULL ORDER BY created_at DESC')
-      return rows
-    }
-    // Logged-in: show only own runs (not public)
     const [rows] = await p.execute('SELECT * FROM training_runs WHERE user_id = ? ORDER BY created_at DESC', [userId])
     return rows
   },
@@ -346,15 +382,45 @@ export const trainingRuns = {
   },
 
   getByIdAndUser: async (id: string, userId: number | null) => {
+    if (userId === null) return null
     const p = await getPool()
-    const [rows] = await p.execute('SELECT * FROM training_runs WHERE id = ? AND (user_id = ? OR (? IS NULL AND user_id IS NULL))', [id, userId, userId]) as any[]
+    const [rows] = await p.execute('SELECT * FROM training_runs WHERE id = ? AND user_id = ?', [id, userId]) as any[]
     return rows[0] || null
+  },
+
+  updateState: async (id: string, state: RunState, connection?: DbConnection): Promise<boolean> => {
+    return inTransaction(connection, async conn => {
+      const [rows] = await conn.execute('SELECT state_json FROM training_runs WHERE id = ? FOR UPDATE', [id])
+      if (!rows.length) return false
+      const previous = jsonValue(rows[0].state_json) as RunState | undefined
+      if (!isNewerRunState(previous, state)) return false
+      await conn.execute(
+        `UPDATE training_runs SET state_json = ?, status = ?, current_score = ?, best_score = ?,
+          total_steps = ?, error_message = ?, artifact_sync_status = ?, artifact_sync_error = ?,
+          ai_summary = IF(?, '', ai_summary) WHERE id = ?`,
+        [JSON.stringify(state), state.status, state.currentScore === null ? null : state.currentScore * 100,
+          state.bestScore === null ? null : state.bestScore * 100, state.completedSteps, state.error ?? '',
+          state.artifactSync, state.artifactError ?? '', previous?.instanceId !== state.instanceId, id],
+      )
+      return true
+    })
+  },
+
+  saveSummary: async (id: string, summary: string, instanceId: string | null, connection?: DbConnection): Promise<boolean> => {
+    return inTransaction(connection, async conn => {
+      const [rows] = await conn.execute('SELECT state_json FROM training_runs WHERE id = ? FOR UPDATE', [id])
+      if (!rows.length) return false
+      const state = jsonValue(rows[0].state_json) as RunState | undefined
+      if ((state?.instanceId ?? null) !== instanceId) return false
+      await conn.execute('UPDATE training_runs SET ai_summary = ? WHERE id = ?', [summary, id])
+      return true
+    })
   },
 
   upsert: async (data: any) => {
     const p = await getPool()
     const keys = Object.keys(data)
-    const values = Object.values(data)
+    const values = Object.values(data) as any[]
     const placeholders = keys.map(() => '?').join(', ')
     const updates = keys.filter(k => k !== 'id' && k !== 'created_at').map(k => `${k} = VALUES(${k})`).join(', ')
     await p.execute(
@@ -499,32 +565,25 @@ export const skillVersions = {
 
 // ─── Training Data ───
 export const trainingData = {
-  getByRunId: async (runId: string) => {
-    const p = await getPool()
+  getByRunId: async (runId: string, connection?: Pick<DbConnection, 'execute'>) => {
+    const p = connection ?? await getPool()
     const [rows] = await p.execute('SELECT * FROM training_data_items WHERE run_id = ? ORDER BY split, item_index', [runId]) as any[]
     const result: any = { train: [], val: [], test: [] }
     for (const r of rows) {
-      result[r.split]?.push({
+      const original = jsonValue(r.item_json)
+      result[r.split]?.push(original && typeof original === 'object' && !Array.isArray(original) ? original : {
         id: String(r.item_index),
         question: r.question,
         context: r.context || '',
-        answers: JSON.parse(r.answers_json || '[]'),
+        answers: jsonValue(r.answers_json) ?? [],
       })
     }
     return result
   },
 
-  upsertBatch: async (runId: string, split: string, items: any[]) => {
-    const p = await getPool()
-    await p.execute('DELETE FROM training_data_items WHERE run_id = ? AND split = ?', [runId, split])
-    if (items.length === 0) return
-    const values: any[] = []
-    const placeholders = items.map((_, i) => {
-      const base = i * 6
-      values.push(runId, split, i, items[i].question || '', items[i].context || '', JSON.stringify(items[i].answers || []))
-      return `(?, ?, ?, ?, ?, ?)`
-    }).join(', ')
-    await p.execute(`INSERT INTO training_data_items (run_id, split, item_index, question, context, answers_json) VALUES ${placeholders}`, values)
+  upsertBatch: async (runId: string, split: string, items: any[], connection?: DbConnection) => {
+    if (!['train', 'val', 'test'].includes(split)) throw new Error('无效的数据集分组')
+    await inTransaction(connection, conn => replaceDataSplit(conn, runId, split, items))
   },
 
   deleteByRunId: async (runId: string) => {
@@ -585,7 +644,7 @@ export const templates = {
   upsert: async (id: string, data: any) => {
     const p = await getPool()
     const keys = Object.keys(data)
-    const values = Object.values(data)
+    const values = Object.values(data) as any[]
     const placeholders = keys.map(() => '?').join(', ')
     const updates = keys.filter(k => k !== 'id' && k !== 'created_at').map(k => `${k} = VALUES(${k})`).join(', ')
     await p.execute(
@@ -752,6 +811,137 @@ export async function migrateFromFiles() {
   } catch (e: any) {
     console.error('[DB] Migration error:', e.message)
   }
+}
+
+export interface DbConnection {
+  execute(sql: string, values?: any[]): Promise<[any, any]>
+  beginTransaction(): Promise<void>
+  commit(): Promise<void>
+  rollback(): Promise<void>
+  release(): void
+}
+
+function jsonValue(value: any): any {
+  return typeof value === 'string' ? JSON.parse(value) : value ?? undefined
+}
+
+async function inTransaction<T>(provided: DbConnection | undefined, work: (connection: DbConnection) => Promise<T>): Promise<T> {
+  const connection = provided ?? await (await getPool()).getConnection()
+  let started = false
+  try {
+    await connection.beginTransaction()
+    started = true
+    const result = await work(connection)
+    await connection.commit()
+    return result
+  } catch (error) {
+    if (started) {
+      try { await connection.rollback() } catch { /* Preserve the original database error. */ }
+    }
+    throw error
+  } finally {
+    if (!provided) connection.release()
+  }
+}
+
+const terminalStatuses = new Set(['completed', 'failed', 'stopped', 'empty'])
+
+export function isNewerRunState(previous: RunState | undefined | null, incoming: RunState): boolean {
+  if (!incoming.instanceId || !Number.isSafeInteger(incoming.attempt) || incoming.attempt < 0 ||
+      !Number.isSafeInteger(incoming.version) || incoming.version < 0 ||
+      !Number.isSafeInteger(incoming.completedSteps) || incoming.completedSteps < 0 ||
+      !Number.isSafeInteger(incoming.totalSteps) || incoming.totalSteps < incoming.completedSteps ||
+      !Number.isSafeInteger(incoming.currentStep) || incoming.currentStep < 0 ||
+      !['pending', 'training', 'completed', 'failed', 'stopped', 'empty'].includes(incoming.status) ||
+      !['pending', 'syncing', 'synced', 'failed'].includes(incoming.artifactSync) ||
+      [incoming.currentScore, incoming.bestScore].some(score => score !== null && (!Number.isFinite(score) || score < 0 || score > 1))) {
+    throw new Error('无效的训练状态')
+  }
+  if (!previous) return true
+  if (incoming.attempt > previous.attempt) return true
+  if (incoming.attempt !== previous.attempt || incoming.instanceId !== previous.instanceId || incoming.version <= previous.version) return false
+  if (terminalStatuses.has(previous.status) && (incoming.status !== previous.status || incoming.phase !== previous.phase)) return false
+  return incoming.completedSteps >= previous.completedSteps
+}
+
+async function insertRows(connection: DbConnection, table: string, columns: string[], rows: any[][], updateKeys?: string[]): Promise<void> {
+  for (let offset = 0; offset < rows.length; offset += 100) {
+    const batch = rows.slice(offset, offset + 100)
+    const placeholders = batch.map(() => `(${columns.map(() => '?').join(',')})`).join(',')
+    const updates = updateKeys?.length ? ` ON DUPLICATE KEY UPDATE ${updateKeys.map(key => `\`${key}\`=VALUES(\`${key}\`)`).join(',')}` : ''
+    await connection.execute(`INSERT INTO \`${table}\` (${columns.map(key => `\`${key}\``).join(',')}) VALUES ${placeholders}${updates}`, batch.flat())
+  }
+}
+
+async function replaceDataSplit(connection: DbConnection, runId: string, split: string, items: JsonObject[]): Promise<void> {
+  await connection.execute('DELETE FROM training_data_items WHERE run_id = ? AND split = ?', [runId, split])
+  await insertRows(connection, 'training_data_items', ['run_id', 'split', 'item_index', 'question', 'context', 'answers_json', 'item_json'],
+    items.map((item, index) => [runId, split, index, item.question ?? '', item.context ?? '', JSON.stringify(item.answers ?? []), JSON.stringify(item)]))
+}
+
+export async function replaceRunArtifacts(runId: string, snapshot: RunArtifactsSnapshot, connection?: DbConnection) {
+  if (snapshot.runId !== runId) throw new Error('产物与任务ID不匹配')
+  const counts = {
+    history: snapshot.history?.length ?? null,
+    skills: snapshot.skills?.length ?? null,
+    data: Object.fromEntries(Object.entries(snapshot.data).map(([split, items]) => [split, items?.length ?? 0])),
+    evaluations: snapshot.evaluations?.length ?? null,
+  }
+  return inTransaction(connection, async conn => {
+    const [runs] = await conn.execute('SELECT id FROM training_runs WHERE id = ? FOR UPDATE', [runId])
+    if (!runs.length) throw new Error('训练任务不存在')
+    const metadata: Record<string, any> = {}
+    if (snapshot.config !== undefined) metadata.config_json = JSON.stringify(snapshot.config)
+    if (snapshot.trainConfig !== undefined) metadata.train_config_json = JSON.stringify(snapshot.trainConfig)
+    if (snapshot.summary !== undefined) metadata.summary_json = JSON.stringify(snapshot.summary)
+    if (snapshot.tokenUsage !== undefined) metadata.token_usage_json = JSON.stringify(snapshot.tokenUsage)
+    const summary = snapshot.summary
+    for (const [source, target] of [['baseline_selection_hard', 'initial_score'], ['baseline_test_hard', 'baseline_test_score'], ['test_hard', 'test_score']] as const) {
+      if (typeof summary?.[source] === 'number') metadata[target] = summary[source] * 100
+    }
+    if (snapshot.history !== undefined) {
+      metadata.accepts = snapshot.history.filter(row => String(row.action ?? '').includes('accept')).length
+      metadata.rejects = snapshot.history.filter(row => row.action === 'reject').length
+      metadata.skips = snapshot.history.length - metadata.accepts - metadata.rejects
+      metadata.accept_rate = snapshot.history.length ? Math.round(metadata.accepts / snapshot.history.length * 100) : 0
+      metadata.slow_updates = snapshot.history.filter(row => row.slow_update).length
+    }
+    const wallTime = summary?.total_wall_time_s ?? summary?.wall_time_s
+    if (typeof wallTime === 'number') {
+      metadata.total_time = `${wallTime.toFixed(1)}s`
+      if (snapshot.history?.length) metadata.avg_per_step = `${(wallTime / snapshot.history.length).toFixed(1)}s`
+    }
+    if (Object.keys(metadata).length) {
+      await conn.execute(`UPDATE training_runs SET ${Object.keys(metadata).map(key => `\`${key}\` = ?`).join(', ')} WHERE id = ?`, [...Object.values(metadata), runId])
+    }
+    if (snapshot.history !== undefined) {
+      await conn.execute('DELETE FROM step_history WHERE run_id = ?', [runId])
+      const columns = ['run_id', 'step', 'epoch', 'step_in_epoch', 'action', 'raw_action', 'current_score', 'best_score', 'rollout_hard', 'rollout_soft', 'selection_hard', 'selection_soft', 'n_patches', 'n_success_patches', 'wall_time_s', 'skill_len', 'tokens_json', 'timing_json', 'candidate_skill']
+      await insertRows(conn, 'step_history', columns, snapshot.history.map(row => [
+        runId, row.step, row.epoch ?? 1, row.step_in_epoch ?? 0, row.action ?? 'skip', row.raw_action ?? row.action ?? '',
+        row.current_score ?? null, row.best_score ?? null, row.rollout_hard ?? null, row.rollout_soft ?? null,
+        row.selection_hard ?? null, row.selection_soft ?? null, row.n_patches ?? 0, row.n_success_patches ?? 0,
+        row.wall_time_s ?? 0, row.skill_len ?? 0, JSON.stringify(row.tokens ?? {}), JSON.stringify(row.timing ?? {}), row.candidate_skill ?? '',
+      ]))
+    }
+    if (snapshot.skills !== undefined) {
+      const columns = ['run_id', 'version', 'name', 'path', 'chars', 'content', 'timestamp']
+      await insertRows(conn, 'skill_versions', columns, snapshot.skills.map(skill => [runId, skill.version, skill.name, skill.path, skill.chars, skill.content, skill.timestamp]), columns.slice(2))
+    }
+    for (const split of ['train', 'val', 'test'] as const) {
+      const items = snapshot.data[split]
+      if (items !== undefined) await replaceDataSplit(conn, runId, split, items)
+    }
+    if (snapshot.evaluations !== undefined) {
+      const columns = ['run_id', 'step', 'phase', 'item_id', 'question', 'gold_answer', 'system_prompt', 'user_prompt', 'model_response', 'extracted_answer', 'is_correct', 'score_em', 'score_f1', 'n_turns', 'tokens_prompt', 'tokens_completion']
+      await insertRows(conn, 'evaluation_details', columns, snapshot.evaluations.map(row => [
+        runId, row.step, row.phase, row.item_id, row.question, row.gold_answer, row.system_prompt, row.user_prompt,
+        row.model_response, row.extracted_answer, row.is_correct, row.score_em, row.score_f1, row.n_turns, row.tokens_prompt, row.tokens_completion,
+      ]), columns.slice(4))
+    }
+    await conn.execute("UPDATE training_runs SET artifact_sync_status = 'synced', artifact_sync_error = '' WHERE id = ?", [runId])
+    return counts
+  })
 }
 
 export { getPool as getConnection }

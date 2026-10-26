@@ -33,9 +33,12 @@ import glob
 import json
 import os
 import random
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
+
+from skillopt.utils.constraints import validate_forbidden_terms
 
 
 @dataclass(slots=True)
@@ -289,7 +292,7 @@ class SplitDataLoader(BaseDataLoader):
                 "`split_mode=ratio` with `data_path`, or `split_mode=split_dir` "
                 f"with `split_dir` pointing to {'/'.join(SPLIT_NAMES)}/."
             )
-        self._load_all_splits()
+        self._load_all_splits(require_test=cfg.get("eval_test", True) is not False)
 
     def _resolve_split_output_dir(self, cfg: dict) -> str:
         if self.split_output_dir:
@@ -344,6 +347,11 @@ class SplitDataLoader(BaseDataLoader):
         rng.shuffle(shuffled)
 
         train_n, val_n, test_n = _compute_split_counts(len(shuffled), ratio)
+        if min(train_n, val_n) == 0 or (cfg.get("eval_test", True) is not False and test_n == 0):
+            raise ValueError(
+                f"Dataset size {len(shuffled)} and split_ratio={self.split_ratio} create an empty split; "
+                "provide more samples or an explicit non-empty train/val/test split."
+            )
         train_items = shuffled[:train_n]
         val_items = shuffled[train_n: train_n + val_n]
         test_items = shuffled[train_n + val_n: train_n + val_n + test_n]
@@ -372,9 +380,12 @@ class SplitDataLoader(BaseDataLoader):
         )
         return split_dir
 
-    def _load_all_splits(self) -> None:
+    def _load_all_splits(self, require_test: bool = True) -> None:
         for name in SPLIT_NAMES:
             split_path = os.path.join(self.split_dir, name)
+            if name == "test" and not require_test and not os.path.isdir(split_path):
+                self._splits[name] = []
+                continue
             if not os.path.isdir(split_path):
                 raise ValueError(
                     f"Missing '{name}/' subdirectory in split_dir: {self.split_dir}"
@@ -382,8 +393,34 @@ class SplitDataLoader(BaseDataLoader):
             items = self.load_split_items(split_path)
             if self.limit:
                 items = items[: self.limit]
+            if not items and (name != "test" or require_test):
+                raise ValueError(f"Dataset split '{name}' is empty; no evaluation score can be produced.")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError(f"Dataset split '{name}' must contain objects")
+                validate_forbidden_terms(item.get("forbidden_terms", []))
             self._splits[name] = items
 
+        sources: dict[str, set[str]] = {}
+        for split, items in self._splits.items():
+            values = set()
+            for item in items:
+                if item.get("docId") is not None:
+                    values.add(f"docId:{item['docId']}")
+                files = item.get("source_files") or []
+                if isinstance(files, str):
+                    files = [files]
+                values.update(f"source:{path}" for path in files)
+            sources[split] = values
+        for first, second in (("train", "val"), ("train", "test"), ("val", "test")):
+            overlap = sources.get(first, set()) & sources.get(second, set())
+            if overlap:
+                warnings.warn(
+                    f"Dataset splits {first}/{second} share {len(overlap)} source documents; "
+                    "these scores do not establish new-document generalization.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         counts = " ".join(f"{k}={len(v)}" for k, v in self._splits.items())
         print(f"  [{type(self).__name__}] {counts}  (from {self.split_dir})")
 

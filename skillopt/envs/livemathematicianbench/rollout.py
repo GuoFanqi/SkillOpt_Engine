@@ -10,6 +10,8 @@ from skillopt.envs.livemathematicianbench.evaluator import evaluate
 from skillopt.model import chat_target, get_target_backend, is_target_exec_backend
 from skillopt.model.codex_harness import prepare_workspace, render_skill_md, run_target_exec
 from skillopt.prompts import load_prompt
+from skillopt.utils.rollout_cache import prepare_rollout_cache
+from skillopt.utils.scoring import ensure_complete_evaluation
 
 def _build_system(skill_content: str) -> str:
     if skill_content.strip():
@@ -283,6 +285,7 @@ def process_one(
 
     except Exception as e:  # noqa: BLE001
         result["fail_reason"] = f"error: {e}"
+        result["execution_error"] = True
 
     return result
 
@@ -309,23 +312,19 @@ def run_batch(
         task_timeout = None
     else:
         task_timeout = max(task_timeout_value, exec_timeout_value + 60)
-    results_path = os.path.join(out_root, "results.jsonl")
-    os.makedirs(out_root, exist_ok=True)
-
-    done_ids: set[str] = set()
-    existing: list[dict] = []
-    if os.path.exists(results_path):
-        with open(results_path) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    done_ids.add(str(r["id"]))
-                    existing.append(r)
-                except Exception:
-                    pass
-
-    pending = [it for it in items if str(it["id"]) not in done_ids]
+    results_path, existing, pending = prepare_rollout_cache(
+        out_root, items, skill_content,
+        {
+            "environment": "livemathematicianbench", "max_turns": max_turns,
+            "exec_timeout": exec_timeout, "task_timeout": task_timeout,
+            "max_completion_tokens": max_completion_tokens, "use_theorem": use_theorem,
+            "use_sketch": use_sketch, "diagnostic_mode": diagnostic_mode,
+            "diagnostic_instruction": diagnostic_instruction,
+            "diagnostic_trace_context_by_id": diagnostic_trace_context_by_id,
+        },
+    )
     if not pending:
+        ensure_complete_evaluation(existing)
         return existing
 
     total = len(existing) + len(pending)
@@ -431,4 +430,5 @@ def run_batch(
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
 
+    ensure_complete_evaluation(results)
     return results

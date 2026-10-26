@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from skillopt.model import chat_optimizer
@@ -253,6 +252,38 @@ def _resolve_prompt(custom: str | None, default_name: str, update_mode: str = "p
 # ── Minibatch analysts ──────────────────────────────────────────────────────
 
 
+class ReflectionError(RuntimeError):
+    pass
+
+
+def _call_analyst(system: str, user: str, update_mode: str) -> dict:
+    try:
+        response, _ = chat_optimizer(
+            system=system,
+            user=user,
+            max_completion_tokens=64000 if is_full_rewrite_minibatch_mode(update_mode) else 16384,
+            retries=3,
+            stage="analyst",
+        )
+    except Exception as exc:
+        raise ReflectionError("Reflection model request failed.") from exc
+
+    try:
+        result = extract_json(response)
+    except (TypeError, ValueError) as exc:
+        raise ReflectionError("Reflection response is not valid JSON.") from exc
+    if not isinstance(result, dict):
+        raise ReflectionError("Reflection response must contain a JSON object.")
+    if "patch" in result:
+        patch = result["patch"]
+        key = payload_key(update_mode)
+        if not isinstance(patch, dict) or not isinstance(patch.get(key), list):
+            raise ReflectionError(f"Reflection patch must contain a {key!r} list.")
+        if any(not isinstance(item, dict) for item in patch[key]):
+            raise ReflectionError(f"Reflection patch {key!r} entries must be objects.")
+    return result
+
+
 def run_error_analyst_minibatch(
     skill_content: str,
     items: list[dict],
@@ -291,7 +322,7 @@ def run_error_analyst_minibatch(
     Returns
     -------
     dict | None
-        Patch dict with ``source_type="failure"``, or ``None`` on error.
+        Patch dict with ``source_type="failure"``, or ``None`` when no trajectory is available.
     """
     mode = normalize_update_mode(update_mode)
     actual_system = _resolve_prompt(system_prompt, "analyst_error", mode)
@@ -330,37 +361,22 @@ def run_error_analyst_minibatch(
         user += optimizer_ctx + "\n\n"
     user += f"## Failed Trajectories ({len(items)} total)\n{trajectories_text}"
 
-    try:
-        response, _ = chat_optimizer(
-            system=actual_system, user=user,
-            max_completion_tokens=64000 if is_full_rewrite_minibatch_mode(mode) else 16384,
-            retries=3,
-            stage="analyst",
-        )
-        result = extract_json(response)
-        if not result:
-            return None
-        notes = extract_appendix_notes(result) if skill_aware_reflection else []
-        if "patch" in result:
-            result["source_type"] = "failure"
-            if not is_full_rewrite_minibatch_mode(mode):
-                truncate_payload(result["patch"], edit_budget, mode)
-            if skill_aware_reflection:
-                result["appendix_notes"] = notes
-            return result
-        # Skill-aware: a batch may legitimately yield ONLY execution-lapse notes
-        # (no body edit). Return a no-op patch so the notes still reach the
-        # trainer via all_raw_patches; empty edits are dropped from the body
-        # pipeline by _normalise_patches, so body behavior is unchanged.
-        if skill_aware_reflection and notes:
-            return {
-                "source_type": "failure",
-                "patch": {"reasoning": "execution-lapse only", "edits": []},
-                "appendix_notes": notes,
-            }
-    except Exception:  # noqa: BLE001
-        traceback.print_exc()
-    return None
+    result = _call_analyst(actual_system, user, mode)
+    notes = extract_appendix_notes(result) if skill_aware_reflection else []
+    if "patch" in result:
+        result["source_type"] = "failure"
+        if not is_full_rewrite_minibatch_mode(mode):
+            truncate_payload(result["patch"], edit_budget, mode)
+        if skill_aware_reflection:
+            result["appendix_notes"] = notes
+        return result
+    if skill_aware_reflection and notes:
+        return {
+            "source_type": "failure",
+            "patch": {"reasoning": "execution-lapse only", payload_key(mode): []},
+            "appendix_notes": notes,
+        }
+    raise ReflectionError("Failure analyst response is missing a patch.")
 
 
 def run_success_analyst_minibatch(
@@ -391,7 +407,7 @@ def run_success_analyst_minibatch(
     Returns
     -------
     dict | None
-        Patch dict with ``source_type="success"``, or ``None`` on error.
+        Patch dict with ``source_type="success"``, or ``None`` when no trajectory is available.
     """
     mode = normalize_update_mode(update_mode)
     actual_system = _resolve_prompt(system_prompt, "analyst_success", mode)
@@ -427,24 +443,22 @@ def run_success_analyst_minibatch(
         user += optimizer_ctx + "\n\n"
     user += f"## Successful Trajectories ({len(items)} total)\n{trajectories_text}"
 
-    try:
-        response, _ = chat_optimizer(
-            system=actual_system, user=user,
-            max_completion_tokens=64000 if is_full_rewrite_minibatch_mode(mode) else 16384,
-            retries=3,
-            stage="analyst",
-        )
-        result = extract_json(response)
-        if result and "patch" in result:
-            result["source_type"] = "success"
-            if not is_full_rewrite_minibatch_mode(mode):
-                truncate_payload(result["patch"], edit_budget, mode)
-            if sa_emit:
-                result["appendix_notes"] = extract_appendix_notes(result)
-            return result
-    except Exception:  # noqa: BLE001
-        traceback.print_exc()
-    return None
+    result = _call_analyst(actual_system, user, mode)
+    notes = extract_appendix_notes(result) if sa_emit else []
+    if "patch" in result:
+        result["source_type"] = "success"
+        if not is_full_rewrite_minibatch_mode(mode):
+            truncate_payload(result["patch"], edit_budget, mode)
+        if sa_emit:
+            result["appendix_notes"] = notes
+        return result
+    if sa_emit and notes:
+        return {
+            "source_type": "success",
+            "patch": {"reasoning": "appendix notes only", payload_key(mode): []},
+            "appendix_notes": notes,
+        }
+    raise ReflectionError("Success analyst response is missing a patch.")
 
 
 # ── Minibatch reflect dispatcher ────────────────────────────────────────────

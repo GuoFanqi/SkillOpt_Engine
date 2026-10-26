@@ -12,7 +12,21 @@ def _parse_bool(value: str | None, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-OPTIMIZER_BACKEND = normalize_backend_name(os.environ.get("OPTIMIZER_BACKEND", "openai_chat"))
+_OPTIMIZER_BACKENDS = {"openai_chat", "claude_chat", "qwen_chat"}
+
+
+def _validate_optimizer_backend(backend: str) -> str:
+    normalized = normalize_backend_name(backend or "openai_chat")
+    if normalized not in _OPTIMIZER_BACKENDS:
+        raise ValueError(
+            f"Unsupported optimizer backend: {normalized!r}. "
+            "Supported values are 'openai_chat', 'claude_chat', and 'qwen_chat'; "
+            "MiniMax is supported only as a target backend."
+        )
+    return normalized
+
+
+OPTIMIZER_BACKEND = _validate_optimizer_backend(os.environ.get("OPTIMIZER_BACKEND", "openai_chat"))
 TARGET_BACKEND = normalize_backend_name(os.environ.get("TARGET_BACKEND", "openai_chat"))
 
 CODEX_EXEC_PATH = os.environ.get("CODEX_EXEC_PATH", "codex")
@@ -48,12 +62,7 @@ CLAUDE_CODE_EXEC_MAX_THINKING_TOKENS = max(
 
 def set_optimizer_backend(backend: str) -> None:
     global OPTIMIZER_BACKEND
-    OPTIMIZER_BACKEND = normalize_backend_name(backend or "openai_chat")
-    if OPTIMIZER_BACKEND not in {"openai_chat", "claude_chat", "qwen_chat", "minimax_chat"}:
-        raise ValueError(
-            f"Unsupported optimizer backend: {OPTIMIZER_BACKEND!r}. "
-            "Supported values are 'openai_chat', 'claude_chat', 'qwen_chat', and 'minimax_chat'."
-        )
+    OPTIMIZER_BACKEND = _validate_optimizer_backend(backend)
     os.environ["OPTIMIZER_BACKEND"] = OPTIMIZER_BACKEND
 
 
@@ -81,7 +90,7 @@ def is_target_exec_backend() -> bool:
 
 
 def is_optimizer_chat_backend() -> bool:
-    return OPTIMIZER_BACKEND in {"openai_chat", "claude_chat", "qwen_chat", "minimax_chat"}
+    return OPTIMIZER_BACKEND in _OPTIMIZER_BACKENDS
 
 
 def is_target_chat_backend() -> bool:

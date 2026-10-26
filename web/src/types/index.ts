@@ -1,4 +1,8 @@
+import type { RunState } from '../../shared/run-state'
+export type { RunState, RunPhase, RunStatus } from '../../shared/run-state'
+
 export interface TrainingRun {
+  state?: RunState
   id: string
   name: string
   path: string

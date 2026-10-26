@@ -5,9 +5,6 @@ Connects the ReflACT training loop to SpreadsheetBench by implementing
 """
 from __future__ import annotations
 
-import json
-import os
-
 from skillopt.datasets.base import BatchSpec
 from skillopt.envs.base import EnvAdapter
 from skillopt.envs.spreadsheetbench.dataloader import SpreadsheetBenchDataLoader
@@ -103,20 +100,6 @@ class SpreadsheetBenchAdapter(EnvAdapter):
           - ``"react"``: ReAct agent with tool-call (legacy)
         """
         items = env_manager  # For static datasets, env_manager is a list of items
-        results_path = os.path.join(out_dir, "results.jsonl")
-        os.makedirs(out_dir, exist_ok=True)
-
-        # Resume support
-        if os.path.exists(results_path):
-            existing: list[dict] = []
-            with open(results_path) as f:
-                for line in f:
-                    try:
-                        existing.append(json.loads(line))
-                    except Exception:
-                        pass
-            if existing:
-                return existing
 
         if self.mode in ("single", "multi"):
             results = run_spreadsheet_batch_codegen(
@@ -148,10 +131,6 @@ class SpreadsheetBenchAdapter(EnvAdapter):
                 diagnostic_instruction=kwargs.get("diagnostic_instruction", ""),
                 diagnostic_trace_context_by_id=kwargs.get("diagnostic_trace_context_by_id"),
             )
-
-        with open(results_path, "w") as f:
-            for r in results:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
         return results
 

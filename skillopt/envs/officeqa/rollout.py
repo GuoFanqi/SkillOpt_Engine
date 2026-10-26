@@ -14,6 +14,8 @@ from skillopt.envs.officeqa.tool_runtime import (
 from skillopt.model import chat_target_messages, get_target_backend, is_target_exec_backend
 from skillopt.model.codex_harness import prepare_workspace, render_skill_md, run_target_exec
 from skillopt.prompts import load_prompt
+from skillopt.utils.rollout_cache import prepare_rollout_cache
+from skillopt.utils.scoring import ensure_complete_evaluation
 _TOOL_SCHEMAS = [
     {
         "type": "function",
@@ -576,6 +578,7 @@ def process_one(
     final_response = ""
     final_answer = ""
     fail_reason = ""
+    execution_error = False
     last_response_metadata: dict = {}
     allowed_files = [os.path.basename(path) for path in candidate_files]
     try:
@@ -685,6 +688,7 @@ def process_one(
                     break
     except Exception as e:  # noqa: BLE001
         fail_reason = f"error: {e}"
+        execution_error = True
     with open(os.path.join(pred_dir, "target_system_prompt.txt"), "w", encoding="utf-8") as f:
         f.write(system)
     with open(os.path.join(pred_dir, "target_user_prompt.txt"), "w", encoding="utf-8") as f:
@@ -708,7 +712,8 @@ def process_one(
         "hard": int(eval_result["em"]),
         "soft": eval_result["f1"],
         "fail_reason": fail_reason or ("" if eval_result["em"] else f"predicted '{eval_result['predicted_answer']}' but expected '{item.get('ground_truth', '')}'"),
-        "agent_ok": not fail_reason,
+        "agent_ok": not execution_error,
+        "execution_error": execution_error,
         "n_turns": len(conversation),
         "last_finish_reason": last_response_metadata.get("finish_reason", ""),
         "target_system_prompt": system,
@@ -735,21 +740,30 @@ def run_batch(
     diagnostic_mode: bool = False,
     diagnostic_instruction: str = "",
 ) -> list[dict]:
-    results_path = os.path.join(out_root, "results.jsonl")
-    os.makedirs(out_root, exist_ok=True)
-    done_ids: set[str] = set()
-    existing: list[dict] = []
-    if os.path.exists(results_path):
-        with open(results_path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                done_ids.add(str(row.get("id")))
-                existing.append(row)
-    pending = [item for item in items if str(item["id"]) not in done_ids]
+    roots = []
+    input_files = set()
+    contexts = {}
+    if _normalize_search_mode(search_mode) != _AZURE_SEARCH_MODE:
+        roots = resolve_docs_roots(data_dirs)
+        for item in items:
+            files = item.get("source_files", [])
+            input_files.update(resolve_candidate_files(files, roots))
+            contexts[str(item["id"])] = build_oracle_parsed_pages_context(files, item.get("source_docs", []), roots)
+    results_path, existing, pending = prepare_rollout_cache(
+        out_root, items, skill_content,
+        {
+            "environment": "officeqa", "max_tool_turns": max_tool_turns,
+            "max_completion_tokens": max_completion_tokens, "search_mode": search_mode,
+            "max_queries_per_turn": max_queries_per_turn, "search_api_url": search_api_url,
+            "search_provider": search_provider, "search_max_num_results": search_max_num_results,
+            "search_timeout_seconds": search_timeout_seconds, "use_local_tools": use_local_tools,
+            "data_dirs": roots or data_dirs, "input_files": sorted(input_files), "oracle_contexts": contexts,
+            "diagnostic_mode": diagnostic_mode,
+            "diagnostic_instruction": diagnostic_instruction,
+        },
+    )
     if not pending:
+        ensure_complete_evaluation(existing)
         return existing
     total = len(existing) + len(pending)
     completed = len(existing)
@@ -782,7 +796,14 @@ def run_batch(
             for item in pending
         }
         for fut in as_completed(futs):
-            res = fut.result()
+            try:
+                res = fut.result()
+            except Exception as exc:
+                res = {
+                    "id": str(futs[fut]["id"]), "hard": 0, "soft": 0.0,
+                    "agent_ok": False, "execution_error": True,
+                    "fail_reason": f"error: {type(exc).__name__}: {exc}",
+                }
             results.append(res)
             completed += 1
             if res.get("hard", 0):
@@ -796,4 +817,5 @@ def run_batch(
             )
             outf.write(json.dumps(res, ensure_ascii=False) + "\n")
             outf.flush()
+    ensure_complete_evaluation(results)
     return results

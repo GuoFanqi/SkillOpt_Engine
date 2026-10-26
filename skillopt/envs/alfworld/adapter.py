@@ -326,17 +326,11 @@ class ALFWorldAdapter(EnvAdapter):
         results_path = os.path.join(out_dir, "results.jsonl")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Resume support
         if os.path.exists(results_path):
-            existing: list[dict] = []
-            with open(results_path) as f:
-                for line in f:
-                    try:
-                        existing.append(json.loads(line))
-                    except Exception:
-                        pass
-            if existing:
-                return existing
+            raise ValueError(
+                "ALFWorld results cannot be reused without a verified simulator fingerprint; "
+                "existing artifacts were preserved. Choose a new output directory."
+            )
 
         if isinstance(env_manager, ALFWorldBatchRun):
             results = self._run_batch(

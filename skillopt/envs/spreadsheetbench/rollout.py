@@ -30,6 +30,8 @@ from skillopt.envs.spreadsheetbench.evaluator import (
     evaluate, _generate_cell_names, _compare_cell_value,
 )
 from skillopt.envs.spreadsheetbench.executor import run_generated_code
+from skillopt.utils.rollout_cache import prepare_rollout_cache
+from skillopt.utils.scoring import ensure_complete_evaluation
 
 
 # ── Data loading ─────────────────────────────────────────────────────────────
@@ -420,6 +422,7 @@ def process_one(
             try:
                 ev = evaluate(pred_path, ap, instruction_type, answer_position_eval)
             except Exception as e:  # noqa: BLE001
+                result["execution_error"] = True
                 ev = {"ok": False, "reason": f"eval-exception: {type(e).__name__}: {e}"}
 
             if ev["ok"]:
@@ -443,6 +446,7 @@ def process_one(
 
     except Exception as e:  # noqa: BLE001
         result["fail_reason"] = f"unexpected: {type(e).__name__}: {e}"
+        result["execution_error"] = True
         result["error"] = traceback.format_exc()
         return result
 
@@ -467,29 +471,24 @@ def run_spreadsheet_batch(
 
     Returns list of result dicts compatible with ``compute_score()``.
     """
-    os.makedirs(out_root, exist_ok=True)
-
-    # Check for already-done items (resume support)
-    results_path = os.path.join(out_root, "results.jsonl")
-    done_ids: set[str] = set()
-    existing: list[dict] = []
-    if os.path.exists(results_path):
-        with open(results_path) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    done_ids.add(str(r["id"]))
-                    existing.append(r)
-                except Exception:
-                    pass
-
-    pending = [it for it in items if str(it["id"]) not in done_ids]
+    items = [{**item, "spreadsheet_path": item.get("spreadsheet_path", f"spreadsheet/{item['id']}")} for item in items]
+    results_path, existing, pending = prepare_rollout_cache(
+        out_root, items, skill_content,
+        {
+            "environment": "spreadsheetbench", "mode": "react", "data_root": data_root,
+            "max_turns": max_turns, "max_completion_tokens": max_completion_tokens,
+            "task_timeout": task_timeout, "diagnostic_mode": diagnostic_mode,
+            "diagnostic_instruction": diagnostic_instruction,
+            "diagnostic_trace_context_by_id": diagnostic_trace_context_by_id,
+        },
+    )
     print(
-        f"  [spreadsheet rollout] total={len(items)} done={len(done_ids)} "
+        f"  [spreadsheet rollout] total={len(items)} done={len(existing)} "
         f"pending={len(pending)} workers={max_api_workers} task_timeout={task_timeout}s"
     )
 
     if not pending:
+        ensure_complete_evaluation(existing)
         return existing
 
     t0 = time.time()
@@ -553,6 +552,8 @@ def run_spreadsheet_batch(
                 except Exception as e:  # noqa: BLE001
                     res = _error_result(item, e)
                 results.append(res)
+                with open(results_path, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(res, ensure_ascii=False) + "\n")
                 finished += 1
                 status = "PASS" if res.get("hard") else ("TIMEOUT" if res.get("phase") == "timeout" else "FAIL")
                 dt = time.time() - t0
@@ -566,6 +567,8 @@ def run_spreadsheet_batch(
                 pending_futs.remove(fut)
                 res = _timeout_result(futs[fut])
                 results.append(res)
+                with open(results_path, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(res, ensure_ascii=False) + "\n")
                 finished += 1
                 status = "TIMEOUT"
                 dt = time.time() - t0
@@ -578,6 +581,7 @@ def run_spreadsheet_batch(
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
 
+    ensure_complete_evaluation(results)
     return results
 
 
@@ -788,6 +792,7 @@ def process_one_codegen(
             try:
                 ev = evaluate(pred_path, ap, instruction_type, answer_position_eval)
             except Exception as e:  # noqa: BLE001
+                result["execution_error"] = True
                 ev = {"ok": False, "reason": f"eval-exception: {type(e).__name__}: {e}"}
 
             if ev["ok"]:
@@ -831,6 +836,7 @@ def process_one_codegen(
 
     except Exception as e:  # noqa: BLE001
         result["fail_reason"] = f"unexpected: {type(e).__name__}: {e}"
+        result["execution_error"] = True
         result["error"] = traceback.format_exc()
         return result
 
@@ -863,28 +869,24 @@ def run_spreadsheet_batch_codegen(
     no_task_timeout = task_timeout <= 0
     task_timeout_label = "none" if no_task_timeout else f"{task_timeout}s"
 
-    os.makedirs(out_root, exist_ok=True)
-
-    results_path = os.path.join(out_root, "results.jsonl")
-    done_ids: set[str] = set()
-    existing: list[dict] = []
-    if os.path.exists(results_path):
-        with open(results_path) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    done_ids.add(str(r["id"]))
-                    existing.append(r)
-                except Exception:
-                    pass
-
-    pending = [it for it in items if str(it["id"]) not in done_ids]
+    items = [{**item, "spreadsheet_path": item.get("spreadsheet_path", f"spreadsheet/{item['id']}")} for item in items]
+    results_path, existing, pending = prepare_rollout_cache(
+        out_root, items, skill_content,
+        {
+            "environment": "spreadsheetbench", "mode": mode, "data_root": data_root,
+            "max_turns": max_turns, "max_completion_tokens": max_completion_tokens,
+            "task_timeout": task_timeout, "use_eval_feedback": use_eval_feedback,
+            "diagnostic_mode": diagnostic_mode, "diagnostic_instruction": diagnostic_instruction,
+            "diagnostic_trace_context_by_id": diagnostic_trace_context_by_id,
+        },
+    )
     print(
-        f"  [spreadsheet codegen-{mode}] total={len(items)} done={len(done_ids)} "
+        f"  [spreadsheet codegen-{mode}] total={len(items)} done={len(existing)} "
         f"pending={len(pending)} workers={max_api_workers} task_timeout={task_timeout_label}"
     )
 
     if not pending:
+        ensure_complete_evaluation(existing)
         return existing
 
     t0 = time.time()
@@ -935,6 +937,8 @@ def run_spreadsheet_batch_codegen(
 
     def _record(res: dict, i: int) -> None:
         results.append(res)
+        with open(results_path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(res, ensure_ascii=False) + "\n")
         status = "PASS" if res.get("hard") else ("TIMEOUT" if res.get("phase") == "timeout" else "FAIL")
         dt = time.time() - t0
         print(
@@ -976,4 +980,5 @@ def run_spreadsheet_batch_codegen(
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
 
+    ensure_complete_evaluation(results)
     return results

@@ -15,6 +15,8 @@ import re
 import string
 from collections import Counter
 
+from skillopt.utils.constraints import check_forbidden_terms
+
 
 def normalize_answer(s: str) -> str:
     """Normalize answer string (SQuAD convention)."""
@@ -85,16 +87,22 @@ def sub_em(prediction: str, gold_answers: list[str]) -> float:
     return 0.0
 
 
-def evaluate(prediction_text: str, gold_answers: list[str]) -> dict:
-    """Evaluate a single QA prediction against gold answers.
-
-    Returns dict with: em, f1, sub_em, predicted_answer, gold_answers.
-    """
+def evaluate(prediction_text: str, gold_answers: list[str], forbidden_terms: list[str] | None = None) -> dict:
+    """Evaluate the answer and any explicitly supplied full-response constraints."""
     answer = extract_answer(prediction_text)
-    return {
+    result = {
         "em": exact_match(answer, gold_answers),
         "f1": f1_score(answer, gold_answers),
         "sub_em": sub_em(answer, gold_answers),
         "predicted_answer": answer,
         "gold_answers": gold_answers,
     }
+    if forbidden_terms is not None:
+        violations = check_forbidden_terms(prediction_text, forbidden_terms)
+        result.update({
+            "constraint_passed": not violations,
+            "constraint_violations": violations,
+            "hard": int(result["em"]) if not violations else 0,
+            "soft": result["f1"] if not violations else 0.0,
+        })
+    return result

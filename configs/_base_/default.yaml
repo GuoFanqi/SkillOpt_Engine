@@ -2,11 +2,11 @@
 # Environment configs should inherit via: _base_: default.yaml
 
 model:
-  backend: deepseek_chat
+  backend: openai_chat
   optimizer: deepseek-chat
   target: deepseek-chat
-  optimizer_backend: deepseek_chat
-  target_backend: deepseek_chat
+  optimizer_backend: openai_chat
+  target_backend: openai_chat
   reasoning_effort: medium
   rewrite_reasoning_effort: ""
   rewrite_max_completion_tokens: 64000
@@ -51,10 +51,6 @@ model:
   minimax_temperature: "0.7"
   minimax_max_tokens: "8000"
   minimax_enable_thinking: "false"
-  optimizer_minimax_base_url: ""    # per-role override
-  target_minimax_base_url: ""       # per-role override
-  optimizer_minimax_api_key: ""
-  target_minimax_api_key: ""
 
 train:
   num_epochs: 4

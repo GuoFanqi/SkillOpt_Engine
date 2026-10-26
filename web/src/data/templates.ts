@@ -20,6 +20,7 @@ export interface SkillTemplate {
   highlights: string[]
   splitRatio: number   // 训练/验证拆分比例，默认 0.8（80%训练，20%验证）
   config: {
+    env?: string
     epochs: number
     batchSize: number
     editBudget: number

@@ -82,6 +82,8 @@ def _hierarchical_merge(
 
     Same-level batches are executed in PARALLEL via ThreadPoolExecutor.
     """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 2:
+        raise ValueError("merge_batch_size must be an integer >= 2.")
     if not patches:
         return {"reasoning": "no patches", payload_key(update_mode): []}
     if len(patches) == 1:
@@ -158,6 +160,8 @@ def merge_patches(
 
     Returns a merged :class:`~skillopt.types.Patch` dict (``edits`` + ``reasoning``).
     """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 2:
+        raise ValueError("merge_batch_size must be an integer >= 2.")
     if verbose:
         print(
             f"    [3/6 AGGREGATE] "
